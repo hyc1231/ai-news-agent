@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>每日 AI 新闻助手</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f7fa;
+            color: #333;
+        }
+        h1 { text-align: center; color: #1a73e8; }
+        .card {
+            background: #fff;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        label {
+            display: block;
+            margin: 12px 0 4px;
+            font-weight: 600;
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        textarea { min-height: 80px; resize: vertical; }
+        .hint { font-size: 12px; color: #888; margin-top: 2px; }
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .primary { background: #1a73e8; color: #fff; }
+        .secondary { background: #e8f0fe; color: #1a73e8; }
+        .danger { background: #fce8e8; color: #d93025; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        #result {
+            white-space: pre-wrap;
+            background: #f8f9fa;
+            border-left: 4px solid #1a73e8;
+            padding: 12px;
+            border-radius: 4px;
+            min-height: 60px;
+        }
+        .history-item {
+            border-bottom: 1px solid #eee;
+            padding: 10px 0;
+        }
+        .history-item:last-child { border-bottom: none; }
+        .history-date { font-size: 12px; color: #888; }
+        .trace-btn { padding: 5px 10px; font-size: 12px; }
+        .trace-panel {
+            margin-top: 6px;
+            font-size: 12px;
+            background: #f8f9fa;
+            border-left: 3px solid #9aa0a6;
+            padding: 8px;
+            white-space: pre-wrap;
+        }
+        .trace-panel .trace-item { padding: 3px 0; }
+        .trace-panel span { color: #888; }
+        .loading { color: #1a73e8; }
+        .error { color: #d93025; }
+        .success { color: #188038; }
+    </style>
+</head>
+<body>
+    <h1>每日 AI 新闻助手</h1>
+
+    <div class="card">
+        <h2>用户设置</h2>
+        <label for="name">称呼</label>
+        <input type="text" id="name" placeholder="例如：张三">
+
+        <label for="email">接收邮箱</label>
+        <input type="email" id="email" placeholder="例如：zhangsan@example.com">
+        <div class="hint">用于接收每日简报，请先在 .env 中配置 SMTP。</div>
+
+        <label for="topics">关注话题（用逗号分隔）</label>
+        <input type="text" id="topics" placeholder="人工智能, 大模型, AI 产品">
+
+        <label for="keywords">关注关键词（用逗号分隔）</label>
+        <input type="text" id="keywords" placeholder="OpenAI, Google, DeepSeek">
+
+        <label for="language">简报语言</label>
+        <select id="language">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+        </select>
+
+        <label for="maxArticles">每日最多条数</label>
+        <input type="number" id="maxArticles" min="1" max="20" value="5">
+
+        <div class="btn-group">
+            <button class="primary" onclick="savePreferences()">保存设置</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>生成简报</h2>
+        <div class="btn-group">
+            <button class="primary" onclick="previewDigest()">预览今日简报</button>
+            <button class="secondary" onclick="generateDigest()">生成并发送邮件</button>
+        </div>
+        <h3>结果</h3>
+        <div id="result">点击上方按钮开始...</div>
+    </div>
+
+    <div class="card">
+        <h2>历史简报</h2>
+        <div class="btn-group">
+            <button class="secondary" onclick="loadHistory()">刷新历史</button>
+        </div>
+        <div id="historyList">暂无历史记录</div>
+    </div>
+
+    <script>
+        const API_BASE = "/api";
+
+        // 页面加载时读取已有偏好
+        async function loadPreferences() {
+            try {
+                const res = await fetch(`${API_BASE}/preferences`);
+                const data = await res.json();
+                document.getElementById("name").value = data.name || "";
+                document.getElementById("email").value = data.email || "";
+                document.getElementById("topics").value = (data.topics || []).join(", ");
+                document.getElementById("keywords").value = (data.keywords || []).join(", ");
+                document.getElementById("language").value = data.language || "zh";
+                document.getElementById("maxArticles").value = data.max_articles || 5;
+            } catch (e) {
+                showResult("加载偏好失败：" + e.message, "error");
+            }
+        }
+
+        function splitList(value) {
+            return value.split(/[,，]/).map(s => s.trim()).filter(s => s);
+        }
+
+        function getPreferencesFromForm() {
+            return {
+                name: document.getElementById("name").value.trim(),
+                email: document.getElementById("email").value.trim(),
+                topics: splitList(document.getElementById("topics").value),
+                keywords: splitList(document.getElementById("keywords").value),
+                language: document.getElementById("language").value,
+                max_articles: parseInt(document.getElementById("maxArticles").value, 10) || 5,
+            };
+        }
+
+        async function savePreferences() {
+            showResult("保存中...", "loading");
+            try {
+                const res = await fetch(`${API_BASE}/preferences`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(getPreferencesFromForm()),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showResult("设置已保存", "success");
+                } else {
+                    showResult("保存失败：" + (data.detail || "未知错误"), "error");
+                }
+            } catch (e) {
+                showResult("保存失败：" + e.message, "error");
+            }
+        }
+
+        async function previewDigest() {
+            showResult("正在生成预览...", "loading");
+            try {
+                const res = await fetch(`${API_BASE}/preview`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ query: "" }),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showResult(data.digest || "未生成内容", "");
+                } else {
+                    showResult("预览失败：" + (data.detail || "未知错误"), "error");
+                }
+            } catch (e) {
+                showResult("预览失败：" + e.message, "error");
+            }
+        }
+
+        async function generateDigest() {
+            if (!confirm("确定要生成并发送今日简报吗？如果配置了 SMTP，会发送邮件。生成过程可能需要 1-3 分钟。")) {
+                return;
+            }
+            showResult("任务已提交，Agent 正在后台自主决策并执行...", "loading");
+            try {
+                const res = await fetch(`${API_BASE}/generate`, { method: "POST" });
+                if (!res.ok) {
+                    showResult("提交失败：" + ((await res.json()).detail || "未知错误"), "error");
+                    return;
+                }
+                const { task_id } = await res.json();
+                pollGenerateTask(task_id, 0);
+            } catch (e) {
+                showResult("提交失败：" + e.message, "error");
+            }
+        }
+
+        // 轮询任务结果：每 3 秒一次，最多约 5 分钟
+        async function pollGenerateTask(taskId, attempt) {
+            if (attempt > 100) {
+                showResult("等待超时，任务仍在后台执行，请稍后刷新历史记录查看。", "error");
+                return;
+            }
+            try {
+                const res = await fetch(`${API_BASE}/generate/${taskId}`);
+                if (!res.ok) {
+                    showResult("查询任务失败：" + ((await res.json()).detail || "未知错误"), "error");
+                    return;
+                }
+                const data = await res.json();
+                if (data.status === "running") {
+                    showResult(
+                        `Agent 正在自主执行中...\n已等待约 ${attempt * 3} 秒（工具调用由模型决定，通常需要 1-3 分钟）`,
+                        "loading"
+                    );
+                    setTimeout(() => pollGenerateTask(taskId, attempt + 1), 3000);
+                    return;
+                }
+
+                const result = data.result || {};
+                if (data.status === "success") {
+                    showResult("完成：\n" + (result.answer || ""), "success");
+                    loadHistory();
+                } else {
+                    showResult("生成失败：\n" + (result.answer || "未知错误"), "error");
+                }
+            } catch (e) {
+                showResult("查询任务失败：" + e.message, "error");
+            }
+        }
+
+        async function loadHistory() {
+            const listEl = document.getElementById("historyList");
+            listEl.innerHTML = "加载中...";
+            try {
+                const res = await fetch(`${API_BASE}/history`);
+                const data = await res.json();
+                const items = data.history || [];
+                if (items.length === 0) {
+                    listEl.innerHTML = "暂无历史记录";
+                    return;
+                }
+                listEl.innerHTML = items.map(item => `
+                    <div class="history-item">
+                        <div class="history-date">${item.date || ""} ${item.created_at || ""}
+                            ${item.source === "scheduled" ? " · 定时任务" : ""}</div>
+                        <div>${escapeHtml(item.summary || "")}</div>
+                        ${item.trace_id
+                            ? `<div class="btn-group"><button class="secondary trace-btn"
+                                onclick="showTrace('${item.trace_id}', this)">查看 Agent 工具调用轨迹</button></div>
+                               <div class="trace-panel"></div>`
+                            : ""}
+                    </div>
+                `).join("");
+            } catch (e) {
+                listEl.innerHTML = "加载历史失败：" + e.message;
+            }
+        }
+
+        // 展示某次运行里 LLM 实际选择的工具调用顺序
+        async function showTrace(traceId, btn) {
+            const panel = btn.parentElement.nextElementSibling;
+            if (!panel) return;
+            panel.innerHTML = "加载中...";
+            btn.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/trace/${traceId}`);
+                const data = await res.json();
+                const steps = data.steps || [];
+                if (steps.length === 0) {
+                    panel.innerHTML = "<i>本次运行没有工具调用记录。</i>";
+                    return;
+                }
+                panel.innerHTML = steps.map((s, i) => `
+                    <div class="trace-item">
+                        <b>${i + 1}. ${escapeHtml(s.tool || "unknown")}</b>
+                        <span>入参：</span>${escapeHtml(s.arguments || "")}
+                    </div>
+                `).join("");
+            } catch (e) {
+                panel.innerHTML = "加载轨迹失败：" + e.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function showResult(text, type) {
+            const el = document.getElementById("result");
+            el.textContent = text;
+            el.className = type;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement("div");
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // 初始化
+        loadPreferences();
+        loadHistory();
+    </script>
+</body>
+</html>
