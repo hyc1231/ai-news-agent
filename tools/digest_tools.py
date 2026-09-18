@@ -59,7 +59,7 @@ def generate_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) -> 
 用户关注话题：{topics}
 用户关注关键词：{keywords}
 期望语言：{lang_hint}
-最多包含：{max_articles} 条
+最多包含：{max_articles} 条（上限，不是目标）
 
 新闻素材：
 {json.dumps(news, ensure_ascii=False, indent=2)}
@@ -67,7 +67,8 @@ def generate_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) -> 
 请生成简报，要求：
 1. 开头用一句话概述今日最重要动态。
 2. 每条新闻用 ### 标题，下面写 2-3 句摘要，并附原文链接。
-3. 整体控制在 {max_articles} 条以内，按用户关注的重要性和时效性排序。
+3. 条数上限为 {max_articles} 条 —— 这是**上限而不是目标**：素材不足或不够相关时
+   宁可少写几条（两条就是两条），也不要用不相关的新闻凑够数量。
 4. 语言为{lang_hint}。
 5. 如果新闻素材与用户关注话题不相关，请明确指出并只挑选最相关的内容。
 6. 每条新闻都必须标注发布日期与来源（格式如「2026-09-18 · 量子位」）。

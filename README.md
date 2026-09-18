@@ -163,7 +163,7 @@ load_preferences → search_news → generate_digest → send_email
 | `write_file(path, content)` | 写入文件，目录自动创建 |
 | `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件 |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
-| `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤），降级链：Tavily → Bing → RSS → 兜底数据 |
+| `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤 + 相关性筛选），`max_results` 为**上限**；降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
 | `send_email(subject, content, to_email)` | SMTP 推送（465 SSL / 587 STARTTLS） |
 
@@ -199,8 +199,13 @@ load_preferences → search_news → generate_digest → send_email
 - **域名黑名单** —— 视频平台与社交平台（YouTube / B站 / 抖音 / Facebook / Threads 等帖子页）
   不作为新闻来源，从搜索请求和结果两侧同时排除
 - **LLM 相关性打分** —— 各来源的候选**合并去重后统一打分**（最多 12 条，一次批量调用），
-  而不是每篇调一次模型；分数达标（`>= RELEVANCE_THRESHOLD`，默认 6）的排前面，
-  其余仅在数量不足时用于补齐，不会因为"打分偏低"就把当天的新闻全丢掉
+  而不是每篇调一次模型；只返回分数达标（`>= RELEVANCE_THRESHOLD`，默认 6）的条目。
+  只有当一条都不达标时，才退化为给出分最高的几条 —— 宁可给"相关性一般"的当日新闻，
+  也不谎报"今天没有新闻"
+
+> **条数语义**：`max_articles` / `max_results` 是**上限，不是要凑满的目标**。
+> 达标几条就给几条：今天只有 2 条贴合关注方向的新闻，简报里就是 2 条，
+> 不会用不相关的条目补足到 5 条。
 
 > 为什么强调"统一打分"：Tavily 候选带 0-10 的 LLM 分数、RSS 候选只有 0-3 的关键词命中数，
 > 两者直接比较时量纲不一致，结果是优质的 RSS 中文新闻被无差别挤掉，

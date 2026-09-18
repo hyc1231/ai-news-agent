@@ -347,15 +347,19 @@ def _finalize(
     query: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    统一收口：时间过滤 -> 相关性排序 -> 截断。
+    统一收口：时间过滤 -> 相关性排序 -> 按需截断。
 
-    排序分三层，保证「贴合用户关注方向」的今日新闻排在最前面：
+    **max_results 是上限，不是要凑满的目标条数**：达标几条就给几条，
+    绝不为了把数量填满而塞进不相关的新闻（那会让"最多 N 条"变成"必须 N 条"）。
+
+    具体规则：
 
     1. 先用 LLM 给候选池（最多 _LLM_SCORING_LIMIT 条）统一打相关性分。
        **所有来源共用同一把尺子**，这样 RSS 的中文新闻才有机会和 Tavily 的结果公平竞争。
-    2. 分数达标（>= RELEVANCE_THRESHOLD）的一层，其余一层 —— 后者仍然保留，
-       只是在数量不足时才会被用到，不会因为"打分偏低"就把当天的新闻全丢掉。
-    3. 每组内部按「发布时间倒序 + 相关性/关键词分」排列。
+    2. 分数达标（>= RELEVANCE_THRESHOLD）的按「发布时间倒序 + 相关性」返回，最多 max_results 条。
+       达标条目不足 max_results 时就返回这几条 —— 当天贴合关注方向的新闻本来有多少就是多少。
+    3. 只有当**一条都不达标**时，才退化为给分数最高的几条：宁可给出"相关性一般"的当日新闻，
+       也不要谎报"今天没有新闻"（那样用户会以为当天真的什么都没有）。
     """
     kept, _stats = filter_by_date(candidates)
     if not kept:
@@ -371,14 +375,18 @@ def _finalize(
             article["relevance_score"] = score
 
         strong = [a for a in pool if a.get("relevance_score", 0) >= RELEVANCE_THRESHOLD]
-        weak = [a for a in pool if a.get("relevance_score", 0) < RELEVANCE_THRESHOLD]
-        result = _sort_articles(strong) + _sort_articles(weak) + _sort_articles(ordered[_LLM_SCORING_LIMIT:])
-        return result[:max_results]
+        if strong:
+            # 达标几条给几条，不用低分条目补满
+            return _sort_articles(strong)[:max_results]
+
+        # 一条都不达标时的退化路径（仍然不超过上限）
+        return _sort_articles(pool)[:max_results]
 
     # 没给查询词（不会发生在正常调用链上）时退化为关键词匹配
     matched = [a for a in ordered if a.get("keyword_score", 0) > 0]
-    unmatched = [a for a in ordered if not a.get("keyword_score", 0)]
-    return (_sort_articles(matched) + _sort_articles(unmatched))[:max_results]
+    if matched:
+        return _sort_articles(matched)[:max_results]
+    return ordered[:max_results]
 
 
 def _llm_score_articles(query: str, articles: List[Dict[str, Any]]) -> List[int]:
@@ -672,9 +680,10 @@ def search_news(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
 
     参数:
         query: 搜索关键词或主题，多个词用空格分隔
-        max_results: 最多返回几条
+        max_results: **上限**条数，不是要凑满的目标。当天贴合关注方向的新闻不足时，
+            返回条数会少于该值，这是正常现象（不会用不相关的新闻补足）。
     返回:
-        匹配的新闻列表，每条包含 title/source/summary/url/tags/date/date_verified。
+        匹配的新闻列表，长度 <= max_results，每条包含 title/source/summary/url/tags/date/date_verified。
         - date 是本地时区的发布日期（YYYY-MM-DD），拿不到真实日期时为 None
         - date_verified=false 表示发布时间无法从来源确认，不得当作"今日新闻"陈述
         - 返回空列表表示：真实新闻源可用，但窗口内确实没有符合条件的新闻
