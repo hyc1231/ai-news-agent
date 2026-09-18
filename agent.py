@@ -25,24 +25,37 @@ from tools.email_tools import send_email
 import db
 
 
-def ensure_chinese(text: str, threshold: float = 0.35) -> str:
+def ensure_language(text: str, language: str = "zh", threshold: float = 0.35) -> str:
     """
-    如果文本中英文字符占比超过阈值，调用 LLM 翻译成中文。
-    用于兜底解决模型偶尔输出英文的问题。
+    兜底纠正输出语言，让最终答案与用户偏好里的 language 保持一致。
+
+    模型偶尔会忽略提示词里的语言要求，这里做最后一道校验：
+    - language="zh"：英文字母占比 >= threshold 视为「英文为主」，翻译成中文；
+    - language="en"：英文字母占比 <= 1 - threshold 视为「中文为主」，翻译成英文。
+    两个方向用同一个阈值，只是判断方向相反。
     """
     if not text:
         return text
 
-    # 只统计字母字符，排除标点、数字、URL 中的英文字母
+    # 只统计字母字符（Python 里汉字也算 alpha），排除标点、数字、URL 中的英文字母
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return text
 
     english_ratio = sum(1 for c in letters if ord(c) < 128) / len(letters)
-    if english_ratio < threshold:
-        return text
 
-    prompt = f"请将以下内容翻译成中文，保持原意和 Markdown 格式，不要添加额外解释：\n\n{text}"
+    if language == "en":
+        if english_ratio > 1 - threshold:
+            return text
+        prompt = (
+            "Translate the following content into English. Keep the original meaning and the "
+            "Markdown formatting intact, and output only the translation:\n\n" + text
+        )
+    else:
+        if english_ratio < threshold:
+            return text
+        prompt = f"请将以下内容翻译成中文，保持原意和 Markdown 格式，不要添加额外解释：\n\n{text}"
+
     try:
         result = chat([{"role": "user", "content": prompt}], temperature=0.3)
         if not result.get("error") and result.get("content"):
@@ -246,7 +259,9 @@ SYSTEM_PROMPT = """你是一名每日新闻助手 Agent。
   **绝对不要用旧新闻、示例数据或自己编造的内容来凑数。**
 
 交付物约定：
-- 最终答案必须是中文；即使工具返回或思考过程中出现英文，返回给用户的每一句都必须是中文。
+- 最终答案的语言必须与用户偏好里的 language 保持一致：language=zh 时通篇中文，
+  language=en 时通篇英文。任务描述里会写明这一次要用哪种语言；即使工具返回值或
+  中间过程出现另一种语言，也不要改变最终答案的语言。
 - 先给一句简明的执行摘要（说明你做了什么、用了哪些工具），然后空一行，再附上完整的 Markdown 简报内容。
 - 简报里每条新闻都必须标注发布日期与来源，方便用户核对时效。
 - 简报条数以用户偏好里的 max_articles 为**上限，不是必须达到的数量**：今天贴合的新闻有几条就写几条，
@@ -333,7 +348,12 @@ def _persist_trace(trace_id: str, trace: List[Dict[str, Any]]) -> None:
         pass
 
 
-def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[str, Any]:
+def run_agent(
+    task: str,
+    max_iterations: int = 10,
+    trace_id: str = "",
+    language: str = "zh",
+) -> Dict[str, Any]:
     """
     运行 ReAct Agent。
     参数:
@@ -341,6 +361,7 @@ def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[s
         max_iterations: 最大迭代次数，防止无限循环
         trace_id: 本次运行的轨迹标识，非空时把工具调用写入数据库，
                   用于回溯"模型这次到底调了哪些工具、什么顺序"
+        language: 最终答案的语言（zh / en），取自用户偏好
     返回:
         包含最终回答、执行轨迹、是否成功的字典
     """
@@ -393,7 +414,7 @@ def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[s
                 })
                 continue
 
-            final_answer = ensure_chinese(content or "（模型未返回内容）")
+            final_answer = ensure_language(content or "（模型未返回内容）", language)
             _persist_trace(trace_id, trace)
             return {
                 "success": True,
@@ -415,7 +436,7 @@ def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[s
     _persist_trace(trace_id, trace)
     return {
         "success": False,
-        "answer": ensure_chinese("达到最大迭代次数，Agent 未能完成任务"),
+        "answer": ensure_language("达到最大迭代次数，Agent 未能完成任务", language),
         "trace": trace,
         "trace_id": trace_id,
         "tool_call_count": sum(len(s.get("tool_results", []) or []) for s in trace),
@@ -432,6 +453,12 @@ def generate_and_send_digest(trace_id: str = "") -> Dict[str, Any]:
     trace_id = trace_id or uuid.uuid4().hex[:12]
     today = datetime.now().strftime("%Y-%m-%d")
 
+    # 语言跟随用户偏好：前端「简报语言」选 English 时，提示词与收尾校验都要用英文。
+    # 偏好读取失败时回落到中文，不影响主流程。
+    prefs = load_preferences()
+    language = "en" if (not prefs.get("error") and prefs.get("language") == "en") else "zh"
+    report_word = "英文" if language == "en" else "中文"
+
     # 把当前生效的时效窗口明确告诉模型，避免它自己"宽限"到旧闻
     start = window_start()
     window_hint = (
@@ -443,9 +470,10 @@ def generate_and_send_digest(trace_id: str = "") -> Dict[str, Any]:
         f"今天是 {today}。请为当前用户完成今日 AI 新闻简报："
         f"只采用{window_hint}的新闻，更早的旧闻一律不要；"
         "让简报尽可能贴合这位用户关注的方向，并按可行的途径把简报送到用户手上。"
-        "完成后用中文回报：先一句执行摘要，再空一行附上完整的 Markdown 简报。"
+        f"完成后用{report_word}回报：先一句执行摘要，再空一行附上完整的 Markdown 简报。"
     )
-    result = run_agent(task, trace_id=trace_id)
-    # run_agent 内部已调用过 ensure_chinese，这里不再重复调用（避免对同一文本跑两遍）
+    result = run_agent(task, trace_id=trace_id, language=language)
+    # run_agent 内部已调用过 ensure_language，这里不再重复调用（避免对同一文本跑两遍）
     result["trace_id"] = trace_id
+    result["language"] = language
     return result

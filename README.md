@@ -54,6 +54,8 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 | `NEWS_MAX_AGE_DAYS` | **时效窗口**：只推送最近 N 天内发布的新闻，默认 `1`（只看今天） | 用默认值。设为 `2` 表示今天+昨天，`7` 表示近一周，`0` 表示不做时间过滤 |
 | `NEWS_STRICT_DATE` | 发布时间无法确认的条目如何处理，默认 `false` | 默认保留并标注「发布时间未确认」；设 `true` 则一律丢弃，只保留能确认发布时间的新闻 |
 | `LLM_MAX_RETRIES` / `LLM_TIMEOUT` / `LLM_RETRY_BACKOFF` | 模型调用重试与超时 | 默认重试 2 次、超时 60s、退避 1.5s |
+| `API_KEY` | **可选接口鉴权**：填了值之后，所有 `/api` 接口都要求请求头 `X-API-Key` 与之匹配 | 留空 = 不鉴权，本机演示零配置即可用 |
+| `CORS_ORIGINS` | 允许跨域访问的来源，逗号分隔 | 默认只允许本机 `http://127.0.0.1:8000` 与 `http://localhost:8000` |
 
 > 密钥**只**通过环境变量读取（全部经 `os.getenv`），代码中不含任何硬编码密钥，`.env` 已被 `.gitignore` 排除。
 
@@ -99,9 +101,23 @@ python migrate.py --check
 
 ### 4. 启动服务
 
+激活过虚拟环境后：
+
 ```bash
 python app.py
 # 或 uvicorn app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+**如果没有激活虚拟环境，请务必写完整的解释器路径**。裸 `python` 可能指向系统里另一个环境，
+那里没装 `pymysql` 等依赖 —— 症状是启动日志里出现「数据库初始化失败」，但服务仍然"启动成功"，
+直到每个碰数据库的接口才开始失败：
+
+```bash
+# Windows PowerShell（在项目根目录下）
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
+
+# macOS / Linux
+./.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开 <http://127.0.0.1:8000> 即可看到界面。
@@ -115,6 +131,19 @@ python app.py
 3. **生成简报** → 生成并发送邮件（后台执行，轮询结果）
 4. **历史简报** → 刷新历史 → 点某条记录的「**查看简报正文**」看完整 Markdown
 5. **历史简报** → 点「**查看 Agent 工具调用轨迹**」看这次模型实际选了哪些工具、什么顺序
+
+### 6. 跑测试
+
+```bash
+pip install -r requirements-dev.txt   # 测试依赖（pytest、httpx）
+pytest                                # 全量测试
+```
+
+测试是**完全离线**的：网络请求与模型调用全部打桩，不需要 API Key、不消耗额度、不会真发邮件；
+数据库强制切到临时目录下的 SQLite，既不碰本机 MySQL，也不污染仓库里的 `data/`。
+
+覆盖范围见 `tests/`：时效过滤与日期换算、`max_results` 上限语义、简报语言设置、
+收件人兜底、shell 白名单与路径沙箱、接口鉴权与数据库故障呈现。
 
 ---
 
@@ -161,7 +190,7 @@ load_preferences → search_news → generate_digest → send_email
 | `read_file(path)` | 读取项目内文件（**拒绝 .env 等敏感文件**） |
 | `search_content(keyword, dir)` | 目录内关键词全文搜索（自动跳过敏感文件） |
 | `write_file(path, content)` | 写入文件，目录自动创建 |
-| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件 |
+| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件；**白名单不含任何解释器**（`python` / `pip` / `uvicorn` / `pytest` 均不在列） |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
 | `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤 + 相关性筛选），`max_results` 为**上限**；降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
@@ -215,6 +244,18 @@ load_preferences → search_news → generate_digest → send_email
 
 邮件。配置了 SMTP 就走邮件（`email_tools.py`），并由 Agent 在跑的时候自己判断要不要发（没配邮箱就不会白调用）。
 
+### 简报语言真的生效
+
+前端「简报语言」（中文 / English）不是摆设，整条链路都跟着它走：
+
+- 任务描述里写明"用中文回报"或"用英文回报"；
+- `digest_tools` 提示词中的「期望语言」跟随该设置；
+- 收尾兜底由 `ensure_chinese()` 改为 `ensure_language(text, language)`：
+  目标中文时英文字母占比过高才翻译，目标英文时反过来，两个方向共用同一阈值。
+
+> 早期版本前端有这个选项，但收尾固定调用 `ensure_chinese()`，选 English 会被翻译回中文 ——
+> 典型的"配置项与实现不一致"，已修正。
+
 ---
 
 ## 三、数据库
@@ -252,15 +293,23 @@ MYSQL_DATABASE=ai_news_agent
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/preferences` | 获取偏好 |
+| GET | `/api/health` | 健康检查，返回 `auth_required`（前端据此决定要不要提示输入访问密钥）；**唯一不需要鉴权的接口** |
+| GET | `/api/preferences` | 获取偏好；数据库故障时返回 **500**（不再伪装成"默认值"） |
 | POST | `/api/preferences` | 保存偏好 |
 | POST | `/api/generate` | 提交生成任务，返回 `task_id`（后台执行）；已有任务在跑时返回 `409` |
 | GET | `/api/generate/{task_id}` | 轮询任务状态与结果 |
-| POST | `/api/preview` | 快速预览（不走 Agent，不发邮件） |
-| GET | `/api/history` | 历史简报列表 |
+| POST | `/api/preview` | 快速预览（不走 Agent，不发邮件）；同一时刻只允许一个预览，并发返回 `409` |
+| GET | `/api/history` | 历史简报列表；读取失败返回 **500**（不再伪装成空列表） |
 | GET | `/api/history/{digest_id}` | 单条简报详情 |
 | GET | `/api/trace/{trace_id}` | **某次运行的工具调用顺序** |
 
+> **鉴权**：`.env` 里的 `API_KEY` 留空时不鉴权（本机演示零配置）；填了值后上表除 `/api/health`
+> 之外的接口都要求请求头 `X-API-Key`，否则 `401`。前端会自动探测并在「设置」里多出一个访问密钥输入框。
+>
+> **故障不再被伪装**：读接口拿到数据库错误时一律返回 `500` 并带上原因。
+> 早期版本把读取失败包装成"默认值 / 空历史"，页面上看起来和"真的没有数据"一模一样，
+> 只有写操作才报错 —— 演示时一旦数据库出问题会极难排查。
+>
 > `/api/generate` 为什么异步？一次完整的 Agent 运行包含多轮模型调用和逐条相关性打分，通常 1–3 分钟。改成后台任务 + 轮询后前端不会再干等到超时。
 
 ---
@@ -286,8 +335,18 @@ ai-news-agent/
 │   ├── digest_tools.py   # 简报生成
 │   └── email_tools.py    # 邮件推送
 ├── frontend/index.html   # 单页前端
+├── tests/                # 离线测试：网络与模型调用全部打桩
+│   ├── conftest.py               # 强制 SQLite + 清空外部密钥 + 关定时任务
+│   ├── test_shell_security.py    # shell 白名单、路径沙箱、敏感文件
+│   ├── test_news_freshness.py    # 日期解析、时区换算、时效窗口
+│   ├── test_max_articles_cap.py  # max_results 是上限而非目标
+│   ├── test_language.py          # 简报语言跟随用户偏好
+│   ├── test_email_recipient.py   # 收件人兜底、HTML 转义
+│   └── test_api.py               # 接口鉴权、数据库故障返回 500
+├── pytest.ini
 ├── data/                 # SQLite 数据与运行时文件（已 gitignore）
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt  # 测试依赖（pytest / httpx）
 ```
 
 ---
@@ -304,13 +363,21 @@ ai-news-agent/
 - **Shell 工具**：命令白名单；危险 token 按**单词边界**匹配（避免 `term` 被误判成 `rm`）；
   禁止管道/重定向/变量展开；工作目录锁定在项目根目录；普通命令不经 shell 执行；
   命令中出现敏感文件引用（含 `type .env*` 通配符、`python -c "open('.env')"` 内嵌写法）会被拒绝
+- **白名单不含任何解释器**：`python` / `python3` / `py` / `pip` / `uvicorn` / `pytest` 都不在允许列表内。
+  这条是安全模型的关键 —— 只拦"敏感文件名"是挡不住的：`write_file` 写一个脚本、再用 `bash` 运行它，
+  就能把 `.env` 全文读进模型上下文，两个工具一组合就是完整的任意代码执行链路。
+  简报流程本身不需要解释器，因此只保留只读的查看类命令
 - **兜底数据**：模拟新闻带 `is_mock` 标记且简报强制加声明，不会被伪装成真实新闻推送
-- **接口**：`/api/trace/{id}` 返回的工具入参与结果均已截断；未知 `/api/*` 返回 404 JSON 而不会回退成 HTML
-- **CORS**：开发环境放开，生产建议改为指定来源
+- **接口**：`/api/trace/{id}` 返回的工具入参与结果均已截断；未知 `/api/*` 返回 404 JSON 而不会回退成 HTML；
+  可选的 `API_KEY` 鉴权（`X-API-Key` 请求头），未配置时不启用
+- **CORS**：默认只允许本机来源（`http://127.0.0.1:8000` 与 `http://localhost:8000`），
+  不再使用 `allow_origins=["*"]`；需要额外来源时用 `CORS_ORIGINS` 显式声明
 
-> **已知边界（如实说明）**：`bash` 白名单里有 `python`，而 `python -c "..."` 本质上等同于任意代码执行，
-> 无法靠命令白名单彻底封堵。这里做的是"阻止模型顺手读到密钥"的低成本防护；
-> 若要真正隔离，应把 shell 工具放到容器/沙箱中执行，或直接不把 `python` 放进白名单。
+> **已知边界（如实说明）**：shell 工具很难同时做到"让模型能干活"和"绝对安全"。
+> 当前做了两条低成本但有效的收敛：① 移除全部解释器，堵死"写脚本再执行"这条绕过路径；
+> ② 敏感文件在文件工具与 shell 工具两个入口都被拒绝。
+> 这能阻止模型**顺手**读到密钥，但不等价于完整的沙箱隔离 —— 若要处理不可信输入，
+> 仍应把工具执行放进容器或独立沙箱。
 
 ---
 
@@ -359,6 +426,16 @@ python scheduler.py
 
 **单次生成的模型调用次数？**
 1 次搜索打分（批量）+ 若干轮 Agent 决策 + 1 次简报生成，通常 1–3 分钟。`/api/generate` 是异步接口，前端轮询即可。
+
+**想把它放到内网或公网给别人访问？**
+先在 `.env` 里设置 `API_KEY`（生成一串随机值即可），并按需显式声明 `CORS_ORIGINS`。
+默认状态下所有接口无鉴权、CORS 又是通配符，任何网站都能调用你的接口触发一次完整 Agent 运行
+（消耗 API 额度并且真的会发邮件）。设置 `API_KEY` 后前端会自动探测到，并在「设置」里多出一个密钥输入框。
+
+**页面显示"暂无历史记录"，是真的没有还是数据库出问题了？**
+现在两者不会混淆：读接口在失败时返回 500，并把原因直接显示在页面上。
+早期版本把读取失败包装成"空列表 / 默认值"，看起来和"真的没有数据"一模一样，
+只有写操作才报错 —— 这也是为什么曾经出现过"保存报错、但页面看起来一切正常"。
 
 **已知取舍**：为了保持"零额外依赖"，`db.py` 每次操作新建连接，没有引入连接池。
 在单用户、低并发场景下开销可忽略；若要上量，建议换成 `SQLAlchemy` + 连接池。

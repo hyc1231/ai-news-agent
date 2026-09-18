@@ -101,8 +101,13 @@ def check() -> int:
         print(f"  [缺失] {missing} —— 请执行 python migrate.py")
         return 1
 
-    pref = load_preferences()
-    history = load_history()
+    try:
+        pref = load_preferences()
+        history = load_history()
+    except Exception as e:
+        # load_history 读取失败时会上抛异常（不伪装成空列表），这里给出可读的结论
+        print(f"  [失败] 读取数据库内容出错：{e}")
+        return 1
     print(f"  偏好记录：{pref}")
     print(f"  历史简报：{len(history)} 条")
     return 0

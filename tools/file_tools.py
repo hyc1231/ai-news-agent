@@ -162,11 +162,14 @@ def save_preferences(preferences: Dict[str, Any]) -> str:
 
 
 def load_history() -> List[Dict[str, Any]]:
-    """读取历史简报列表（来自数据库，按时间倒序）。"""
-    try:
-        return db.load_history()
-    except Exception:
-        return []
+    """
+    读取历史简报列表（来自数据库，按时间倒序）。
+
+    数据库故障时**向上抛出异常**，不返回空列表：否则「读取失败」会被上层
+    伪装成「还没有生成过任何简报」，页面看起来一切正常，排查时会被误导。
+    调用方（API 层、migrate.py）各自决定如何呈现这个错误。
+    """
+    return db.load_history()
 
 
 def save_history(history: List[Dict[str, Any]]) -> str:

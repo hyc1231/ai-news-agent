@@ -99,6 +99,13 @@
 
     <div class="card">
         <h2>用户设置</h2>
+
+        <div id="authRow" style="display:none">
+            <label for="apiKey">访问密钥</label>
+            <input type="password" id="apiKey" placeholder=".env 里设置的 API_KEY">
+            <div class="hint">服务端已开启鉴权（.env 中设置了 API_KEY），填好后保存在本机浏览器，随请求自动携带。</div>
+        </div>
+
         <label for="name">称呼</label>
         <input type="text" id="name" placeholder="例如：张三">
 
@@ -130,8 +137,8 @@
     <div class="card">
         <h2>生成简报</h2>
         <div class="btn-group">
-            <button class="primary" onclick="previewDigest()">预览今日简报</button>
-            <button class="secondary" onclick="generateDigest()">生成并发送邮件</button>
+            <button class="primary" id="previewBtn" onclick="previewDigest()">预览今日简报</button>
+            <button class="secondary" id="generateBtn" onclick="generateDigest()">生成并发送邮件</button>
         </div>
         <h3>结果</h3>
         <div id="result">点击上方按钮开始...</div>
@@ -148,11 +155,41 @@
     <script>
         const API_BASE = "/api";
 
+        // 可选鉴权：服务端 .env 里设置了 API_KEY 时，所有 /api 请求都要带这个头。
+        // 密钥只存在本机浏览器的 localStorage 里，不写进代码。
+        let API_KEY = "";
+
+        function authHeaders(extra) {
+            const headers = Object.assign({}, extra || {});
+            if (API_KEY) headers["X-API-Key"] = API_KEY;
+            return headers;
+        }
+
+        // 服务端没开鉴权时，连密钥输入框都不显示（保持本机演示的清爽）
+        async function initAuth() {
+            try {
+                const res = await fetch(`${API_BASE}/health`);
+                const data = await res.json();
+                if (!data.auth_required) return;
+                const input = document.getElementById("apiKey");
+                input.value = localStorage.getItem("apiKey") || "";
+                API_KEY = input.value;
+                document.getElementById("authRow").style.display = "block";
+            } catch (e) {
+                // 健康检查失败不影响其余功能，后续请求会各自返回明确错误
+            }
+        }
+
         // 页面加载时读取已有偏好
         async function loadPreferences() {
             try {
-                const res = await fetch(`${API_BASE}/preferences`);
-                const data = await res.json();
+                const res = await fetch(`${API_BASE}/preferences`, { headers: authHeaders() });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    // 读取失败必须显式提示，否则页面会把故障显示成「设置都是空的」
+                    showResult("加载偏好失败：" + (data.detail || res.status), "error");
+                    return;
+                }
                 document.getElementById("name").value = data.name || "";
                 document.getElementById("email").value = data.email || "";
                 document.getElementById("topics").value = (data.topics || []).join(", ");
@@ -180,14 +217,20 @@
         }
 
         async function savePreferences() {
+            // 访问密钥不属于偏好数据，只保存在本机浏览器
+            const keyInput = document.getElementById("apiKey");
+            if (keyInput) {
+                API_KEY = keyInput.value.trim();
+                localStorage.setItem("apiKey", API_KEY);
+            }
             showResult("保存中...", "loading");
             try {
                 const res = await fetch(`${API_BASE}/preferences`, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: authHeaders({ "Content-Type": "application/json" }),
                     body: JSON.stringify(getPreferencesFromForm()),
                 });
-                const data = await res.json();
+                const data = await res.json().catch(() => ({}));
                 if (res.ok) {
                     showResult("设置已保存", "success");
                 } else {
@@ -199,14 +242,18 @@
         }
 
         async function previewDigest() {
-            showResult("正在生成预览...", "loading");
+            // 一次预览要跑完整检索加打分（通常 30-60 秒），期间禁用按钮避免重复触发；
+            // 服务端也有单飞锁，即使多点几次也只会执行一次。
+            const btn = document.getElementById("previewBtn");
+            btn.disabled = true;
+            showResult("正在生成预览（通常需要 30-60 秒）...", "loading");
             try {
                 const res = await fetch(`${API_BASE}/preview`, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: authHeaders({ "Content-Type": "application/json" }),
                     body: JSON.stringify({ query: "" }),
                 });
-                const data = await res.json();
+                const data = await res.json().catch(() => ({}));
                 if (res.ok) {
                     showResult(data.digest || "未生成内容", "");
                 } else {
@@ -214,6 +261,8 @@
                 }
             } catch (e) {
                 showResult("预览失败：" + e.message, "error");
+            } finally {
+                btn.disabled = false;
             }
         }
 
@@ -223,7 +272,10 @@
             }
             showResult("任务已提交，Agent 正在后台自主决策并执行...", "loading");
             try {
-                const res = await fetch(`${API_BASE}/generate`, { method: "POST" });
+                const res = await fetch(`${API_BASE}/generate`, {
+                    method: "POST",
+                    headers: authHeaders(),
+                });
                 if (!res.ok) {
                     showResult("提交失败：" + ((await res.json()).detail || "未知错误"), "error");
                     return;
@@ -242,7 +294,7 @@
                 return;
             }
             try {
-                const res = await fetch(`${API_BASE}/generate/${taskId}`);
+                const res = await fetch(`${API_BASE}/generate/${taskId}`, { headers: authHeaders() });
                 if (!res.ok) {
                     showResult("查询任务失败：" + ((await res.json()).detail || "未知错误"), "error");
                     return;
@@ -273,8 +325,13 @@
             const listEl = document.getElementById("historyList");
             listEl.innerHTML = "加载中...";
             try {
-                const res = await fetch(`${API_BASE}/history`);
-                const data = await res.json();
+                const res = await fetch(`${API_BASE}/history`, { headers: authHeaders() });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    // 关键：读失败要和「真的没有历史」区分开，否则数据库故障会被当成空数据
+                    listEl.innerHTML = `<span class="error">加载历史失败：${escapeHtml(data.detail || String(res.status))}</span>`;
+                    return;
+                }
                 const items = data.history || [];
                 if (items.length === 0) {
                     listEl.innerHTML = "暂无历史记录";
@@ -298,7 +355,7 @@
                     </div>
                 `).join("");
             } catch (e) {
-                listEl.innerHTML = "加载历史失败：" + e.message;
+                listEl.innerHTML = `<span class="error">加载历史失败：${escapeHtml(e.message)}</span>`;
             }
         }
 
@@ -327,7 +384,9 @@
             panel.textContent = "加载中...";
             btn.disabled = true;
             try {
-                const res = await fetch(`${API_BASE}/history/${encodeURIComponent(digestId)}`);
+                const res = await fetch(`${API_BASE}/history/${encodeURIComponent(digestId)}`, {
+                    headers: authHeaders(),
+                });
                 if (!res.ok) {
                     const detail = await res.json().catch(() => ({}));
                     panel.textContent = "加载简报失败：" + (detail.detail || res.status);
@@ -354,7 +413,9 @@
             panel.innerHTML = "加载中...";
             btn.disabled = true;
             try {
-                const res = await fetch(`${API_BASE}/trace/${encodeURIComponent(traceId)}`);
+                const res = await fetch(`${API_BASE}/trace/${encodeURIComponent(traceId)}`, {
+                    headers: authHeaders(),
+                });
                 const data = await res.json();
                 const steps = data.steps || [];
                 if (steps.length === 0) {
@@ -388,9 +449,12 @@
             return div.innerHTML;
         }
 
-        // 初始化
-        loadPreferences();
-        loadHistory();
+        // 初始化：先确认是否需要鉴权，再加载数据
+        (async function init() {
+            await initAuth();
+            loadPreferences();
+            loadHistory();
+        })();
     </script>
 </body>
 </html>

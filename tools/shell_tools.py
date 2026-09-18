@@ -10,7 +10,11 @@ Shell 命令工具。为了安全，只允许执行白名单内的只读/低风�
    才交给 cmd /d /c，且此时已禁止所有管道、重定向与变量符号；
 4. 命令中不得出现敏感文件（.env / *.key / *.pem 等）——
    否则 cat .env 就能绕过 file_tools 的敏感文件保护，把密钥读进模型上下文。
-   敏感文件名单与 file_tools 共用 tools/security.py，避免两处不一致。
+   敏感文件名单与 file_tools 共用 tools/security.py，避免两处不一致；
+5. 白名单里**不含任何解释器**（python / pip / uvicorn / pytest 等）。
+   这是本模块安全模型的关键一环：只要还能执行任意代码，第 4 条的文件名单
+   就会被绕过——write_file 写一个脚本，再用 bash 运行它即可读到 .env 全文。
+   因此这里只开放只读的查看类命令，简报流程也不依赖解释器。
 """
 
 import locale
@@ -22,9 +26,11 @@ from pathlib import Path
 from tools.security import PROJECT_ROOT, find_sensitive_reference
 
 # 允许执行的命令白名单（第一个 token 必须命中）
+#
+# 刻意不含 python / python3 / py / pip / uvicorn / pytest 等解释器类命令：
+# 它们能执行任意代码，与 write_file 组合起来就是一条完整的任意代码执行链路
+# （写脚本 -> 运行脚本），敏感文件名单会被整体绕过。只保留只读查看类命令。
 ALLOWED_COMMANDS = (
-    "python", "python3", "py", "pip", "pip3",
-    "uvicorn", "pytest",
     "git", "ls", "dir", "pwd", "echo", "cat", "type",
     "head", "tail", "find", "where",
 )
