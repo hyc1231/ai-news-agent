@@ -41,9 +41,15 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "ai_news_agent")
 
 SQLITE_PATH = DATA_DIR / "agent.db"
 
+# 默认收件人：preferences.email 为空时的兜底来源。
+# 这个配置项目早期是「死配置」——.env 里写了但没有任何代码读取它，
+# 于是 preferences 表为空（新部署、或前端没填过邮箱）时，
+# 定时任务跑到发邮件那一步就会因为收件人为空而失败。
+DEFAULT_RECIPIENT = os.getenv("DEFAULT_RECIPIENT", "").strip()
+
 DEFAULT_PREFERENCES: Dict[str, Any] = {
     "name": "",
-    "email": "",
+    "email": DEFAULT_RECIPIENT,
     "topics": ["人工智能", "大模型", "AI 产品"],
     "keywords": ["OpenAI", "Google", "DeepSeek"],
     "language": "zh",
@@ -249,7 +255,9 @@ def load_preferences() -> Dict[str, Any]:
 
     return {
         "name": row["name"] or "",
-        "email": row["email"] or "",
+        # 表里存在但邮箱为空（用户没在前端填过）时同样回落到 DEFAULT_RECIPIENT，
+        # 只判断「有没有这一行」是不够的。
+        "email": row["email"] or DEFAULT_PREFERENCES["email"],
         "topics": _parse_json_field(row["topics"], DEFAULT_PREFERENCES["topics"]),
         "keywords": _parse_json_field(row["keywords"], DEFAULT_PREFERENCES["keywords"]),
         "language": row["language"] or "zh",

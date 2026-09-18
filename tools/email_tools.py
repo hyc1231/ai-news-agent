@@ -21,6 +21,10 @@ SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USERNAME)
 
+# 收件人兜底：模型偶尔会漏传 to_email，或用户没在前端填过邮箱。
+# 直接在工具这一层兜住，不依赖模型每次都把参数带对。
+DEFAULT_RECIPIENT = os.getenv("DEFAULT_RECIPIENT", "").strip()
+
 
 def send_email(subject: str, content: str, to_email: str) -> str:
     """
@@ -28,12 +32,25 @@ def send_email(subject: str, content: str, to_email: str) -> str:
     参数:
         subject: 邮件主题
         content: 邮件正文（Markdown 格式，会转成 HTML 发送）
-        to_email: 收件人邮箱
+        to_email: 收件人邮箱，留空时回落到环境变量 DEFAULT_RECIPIENT
     返回:
         发送结果描述
     """
-    if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, to_email]):
-        return "邮件发送失败：缺少 SMTP 配置或收件人邮箱"
+    to_email = (to_email or "").strip()
+    used_fallback = False
+    if not to_email and DEFAULT_RECIPIENT:
+        to_email = DEFAULT_RECIPIENT
+        used_fallback = True
+
+    if not to_email:
+        return (
+            "邮件发送失败：未指定收件人，且 .env 里也没配置 DEFAULT_RECIPIENT。"
+            "请在前端「设置」里填写收件人，或补上 DEFAULT_RECIPIENT。"
+        )
+    if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD]):
+        # 分开报错：原来统一报「缺少 SMTP 配置或收件人邮箱」，
+        # 排查时分不清到底是哪一项没配。
+        return "邮件发送失败：SMTP 配置不完整（需要 SMTP_SERVER / SMTP_USERNAME / SMTP_PASSWORD）"
 
     html_content = _markdown_to_html(content)
 
@@ -57,7 +74,8 @@ def send_email(subject: str, content: str, to_email: str) -> str:
                 server.starttls()
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
-        return f"邮件已发送至 {to_email}"
+        note = "（收件人来自 DEFAULT_RECIPIENT 兜底）" if used_fallback else ""
+        return f"邮件已发送至 {to_email}{note}"
     except Exception as e:
         return f"邮件发送失败: {e}"
 

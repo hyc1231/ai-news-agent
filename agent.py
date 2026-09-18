@@ -196,13 +196,17 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "发送邮件到指定邮箱",
+            "description": (
+                "发送邮件到指定邮箱。"
+                "收件人一般取自 load_preferences 返回的 email；"
+                "若该字段为空，会回落到 .env 里的 DEFAULT_RECIPIENT。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "subject": {"type": "string", "description": "邮件主题"},
                     "content": {"type": "string", "description": "邮件正文，Markdown 格式"},
-                    "to_email": {"type": "string", "description": "收件人邮箱"},
+                    "to_email": {"type": "string", "description": "收件人邮箱，留空则由服务端兜底"},
                 },
                 "required": ["subject", "content", "to_email"],
             },

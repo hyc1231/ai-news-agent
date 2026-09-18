@@ -47,6 +47,7 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 | `TAVILY_API_KEY` | Tavily 网页搜索（推荐） | 自动降级到 RSS 源 |
 | `BING_SEARCH_KEY` | Bing 新闻搜索（可选） | 跳过 |
 | `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | 邮件推送 | Agent 会把简报直接返回而不发邮件 |
+| `DEFAULT_RECIPIENT` | 默认收件人 | 前端「设置」里没填邮箱时由它兜底；两边都空才发不出邮件 |
 | `SCHEDULE_TIME` / `TIMEZONE` | 每天几点推送，默认 `08:00` `Asia/Shanghai` | 用默认值 |
 | `ENABLE_SCHEDULER` | 是否在 Web 进程内跑定时任务，默认 `true` | 用默认值；多 worker 部署时设 `false` |
 | `DB_TYPE` 等 | 数据库配置，默认 `sqlite` | 用 SQLite 兜底 |
