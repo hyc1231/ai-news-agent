@@ -37,3 +37,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_trace ON tool_calls (trace_id, step);
+
+-- 定时任务执行记录：主键 (name, run_date) 充当原子锁，
+-- 保证多 worker 部署时同一天同一任务只执行一次。
+CREATE TABLE IF NOT EXISTS job_runs (
+    name       TEXT NOT NULL,
+    run_date   TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (name, run_date)
+);

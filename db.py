@@ -94,14 +94,86 @@ def get_cursor(conn):
         cur.close()
 
 
-def _exec_script(conn, script: str):
-    """执行一段建表/建库脚本。MySQL 支持 multi，SQLite 逐条执行。"""
+def _split_sql_statements(script: str) -> List[str]:
+    """
+    把一段 SQL 脚本拆成独立语句。
+
+    需要自己拆的原因：PyMySQL 默认没有开启 CLIENT.MULTI_STATEMENTS 能力位，
+    把整段脚本丢给 cur.execute() 会在第一条语句后就报 1064 语法错误，
+    所以 MySQL 分支也必须逐条执行，不能依赖驱动的 multi-statement 能力。
+
+    拆分时会跳过字符串/反引号内的分号，并剥掉 -- 行注释与 /* */ 块注释。
+    """
+    statements: List[str] = []
+    buf: List[str] = []
+    quote = ""  # 当前所处的引号类型（' " `），空串表示不在引号内
+    i = 0
+    n = len(script)
+
+    while i < n:
+        ch = script[i]
+        nxt = script[i + 1] if i + 1 < n else ""
+
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote in ("'", '"') and nxt:
+                buf.append(nxt)  # 转义字符：连同后一个字符一起吞掉
+                i += 2
+                continue
+            if ch == quote:
+                if nxt == quote:
+                    buf.append(nxt)  # '' / "" / `` 形式的转义
+                    i += 2
+                    continue
+                quote = ""
+            i += 1
+            continue
+
+        if ch in ("'", '"', "`"):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-" and (i + 2 >= n or script[i + 2] in " \t\r\n"):
+            while i < n and script[i] not in "\r\n":
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i < n - 1 and not (script[i] == "*" and script[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+
+        if ch == ";":
+            statement = "".join(buf).strip()
+            if statement:
+                statements.append(statement)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _exec_script(conn, script: str) -> None:
+    """执行建表脚本。MySQL 与 SQLite 都拆句后逐条执行，保证两条路径行为一致。"""
+    statements = _split_sql_statements(script)
+
     if USE_MYSQL:
         with get_cursor(conn) as cur:
-            cur.execute(script)  # pymysql 不支持 executescript，改为整体执行
+            for statement in statements:
+                cur.execute(statement)
         return
 
-    statements = [s.strip() for s in script.split(";") if s.strip()]
     with conn:
         for statement in statements:
             conn.execute(statement)
@@ -255,7 +327,9 @@ def append_to_history(answer: str, auto: bool = False, trace_id: str = "") -> Di
     追加一条历史简报，自动拆分“执行摘要”和“完整 Markdown 正文”。
     手动触发（auto=False）与定时任务（auto=True）共用这一份实现。
     """
-    digest_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    # id 精确到微秒：旧的秒级 id 在同一秒内会冲突，
+    # 冲突时 ON DUPLICATE KEY UPDATE 会静默覆盖上一条记录。
+    digest_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
 
     summary = answer
     content = ""
@@ -298,23 +372,67 @@ def append_to_history(answer: str, auto: bool = False, trace_id: str = "") -> Di
 
 
 def prune_history(keep: int = 30) -> None:
-    """只保留最近 keep 条历史简报，其余删除。"""
+    """
+    只保留最近 keep 条历史简报，其余删除，
+    并同步删除这些简报对应的工具调用轨迹——否则 tool_calls 会无界增长。
+    """
     select_sql = (
-        "SELECT id FROM digests ORDER BY created_at DESC LIMIT %s, 9999" if USE_MYSQL
-        else "SELECT id FROM digests ORDER BY created_at DESC LIMIT -1 OFFSET %s"
+        "SELECT id, trace_id FROM digests ORDER BY created_at DESC LIMIT %s, 9999" if USE_MYSQL
+        else "SELECT id, trace_id FROM digests ORDER BY created_at DESC LIMIT -1 OFFSET %s"
     )
-    delete_sql = "DELETE FROM digests WHERE id = %s"
+    delete_digest_sql = "DELETE FROM digests WHERE id = %s"
+    delete_trace_sql = "DELETE FROM tool_calls WHERE trace_id = %s"
 
     with get_conn() as conn, get_cursor(conn) as cur:
         cur.execute(select_sql if USE_MYSQL else _to_sqlite_sql(select_sql), (keep,))
         rows = cur.fetchall() or []
-        if rows:
+        if not rows:
+            return
+
+        cur.executemany(
+            delete_digest_sql if USE_MYSQL else _to_sqlite_sql(delete_digest_sql),
+            [(row["id"],) for row in rows],
+        )
+        trace_ids = [row["trace_id"] for row in rows if row["trace_id"]]
+        if trace_ids:
             cur.executemany(
-                delete_sql if USE_MYSQL else _to_sqlite_sql(delete_sql),
-                [(row["id"],) for row in rows],
+                delete_trace_sql if USE_MYSQL else _to_sqlite_sql(delete_trace_sql),
+                [(trace_id,) for trace_id in trace_ids],
             )
         if not USE_MYSQL:
             conn.commit()
+
+
+# ---------------- 定时任务去重 ----------------
+
+def claim_daily_run(name: str, run_date: Optional[str] = None) -> bool:
+    """
+    抢占「某天某个定时任务」的执行权，抢到返回 True。
+
+    为什么需要：多 worker 部署时（uvicorn --workers N）每个进程都会启动一个
+    APScheduler，同一时刻会有 N 个进程同时触发任务，结果一天发出 N 封邮件。
+    这里用数据库主键做原子抢占——只有第一个 INSERT 成功的进程才真正执行。
+    """
+    run_date = run_date or datetime.now().strftime("%Y-%m-%d")
+
+    if USE_MYSQL:
+        sql = "INSERT IGNORE INTO job_runs (name, run_date) VALUES (%s, %s)"
+    else:
+        sql = (
+            "INSERT INTO job_runs (name, run_date) VALUES (%s, %s) "
+            "ON CONFLICT(name, run_date) DO NOTHING"
+        )
+
+    try:
+        with get_conn() as conn, get_cursor(conn) as cur:
+            cur.execute(sql if USE_MYSQL else _to_sqlite_sql(sql), (name, run_date))
+            inserted = cur.rowcount > 0
+            if not USE_MYSQL:
+                conn.commit()
+        return inserted
+    except Exception:
+        # 抢占失败（含表不存在）时保守放行，避免定时任务彻底停摆
+        return True
 
 
 def get_history_item(digest_id: str) -> Optional[Dict[str, Any]]:

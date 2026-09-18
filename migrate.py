@@ -83,7 +83,7 @@ def migrate_from_json() -> int:
 def check() -> int:
     """连通性与表结构自检。"""
     print(f"当前数据库后端：{'MySQL' if USE_MYSQL else 'SQLite'}")
-    tables = ["preferences", "digests", "tool_calls"]
+    tables = ["preferences", "digests", "tool_calls", "job_runs"]
     with get_conn() as conn, get_cursor(conn) as cur:
         if USE_MYSQL:
             cur.execute(

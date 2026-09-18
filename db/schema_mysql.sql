@@ -1,16 +1,17 @@
 -- =============================================================
 -- 每日 AI 新闻助手 Agent —— MySQL 建表脚本
--- 用法：
---   mysql -u root -p < db/schema_mysql.sql
--- 或在 migrate.py 中自动执行（推荐）：
---   set DB_TYPE=mysql && python migrate.py
+--
+-- 本脚本只包含「数据表」DDL，不含 CREATE DATABASE / USE，
+-- 以避免把库名写死。库名由环境变量 MYSQL_DATABASE 决定：
+--
+--   方式一（推荐，自动建库 + 建表）：
+--     set DB_TYPE=mysql && python migrate.py
+--     库名来自 .env 的 MYSQL_DATABASE（默认 ai_news_agent）
+--
+--   方式二（手动执行，需要自己先建库并选中）：
+--     mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS ai_news_agent DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+--     mysql -u root -p ai_news_agent < db/schema_mysql.sql
 -- =============================================================
-
-CREATE DATABASE IF NOT EXISTS ai_news_agent
-  DEFAULT CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-
-USE ai_news_agent;
 
 -- 用户偏好：单用户场景，约定只有 id=1 这一行
 CREATE TABLE IF NOT EXISTS preferences (
@@ -52,4 +53,14 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_tool_calls_trace (trace_id, step)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 定时任务执行记录：主键 (name, run_date) 充当原子锁。
+-- 多 worker 部署时每个进程各有一个 APScheduler，靠这张表保证
+-- 同一天同一个任务只真正执行一次，不会重复发多封邮件。
+CREATE TABLE IF NOT EXISTS job_runs (
+    name       VARCHAR(32) NOT NULL,
+    run_date   DATE        NOT NULL,
+    started_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (name, run_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
