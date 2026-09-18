@@ -48,7 +48,9 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 | `BING_SEARCH_KEY` | Bing 新闻搜索（可选） | 跳过 |
 | `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | 邮件推送 | Agent 会把简报直接返回而不发邮件 |
 | `SCHEDULE_TIME` / `TIMEZONE` | 每天几点推送，默认 `08:00` `Asia/Shanghai` | 用默认值 |
+| `ENABLE_SCHEDULER` | 是否在 Web 进程内跑定时任务，默认 `true` | 用默认值；多 worker 部署时设 `false` |
 | `DB_TYPE` 等 | 数据库配置，默认 `sqlite` | 用 SQLite 兜底 |
+| `LLM_MAX_RETRIES` / `LLM_TIMEOUT` / `LLM_RETRY_BACKOFF` | 模型调用重试与超时 | 默认重试 2 次、超时 60s、退避 1.5s |
 
 > 密钥**只**通过环境变量读取（全部经 `os.getenv`），代码中不含任何硬编码密钥，`.env` 已被 `.gitignore` 排除。
 
@@ -72,10 +74,12 @@ export DB_TYPE=mysql MYSQL_USER=root MYSQL_PASSWORD=你的密码
 python migrate.py
 ```
 
-也可以直接执行建表脚本：
+也可以直接执行建表脚本（脚本只含建表 DDL，不含 `CREATE DATABASE`/`USE`，
+库名由 `MYSQL_DATABASE` 决定，所以手动执行时要先自己建库并选中）：
 
 ```bash
-mysql -u root -p < db/schema_mysql.sql
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS ai_news_agent DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+mysql -u root -p ai_news_agent < db/schema_mysql.sql
 ```
 
 首次运行时会把旧的 `data/*.json` 数据一并迁移进库：
@@ -106,7 +110,8 @@ python app.py
 1. **用户设置** → 填写称呼、邮箱、关注话题、关键词 → 保存设置
 2. **生成简报** → 预览今日简报（快速，不走 Agent）
 3. **生成简报** → 生成并发送邮件（后台执行，轮询结果）
-4. **历史简报** → 刷新历史 → 点某条记录的「**查看 Agent 工具调用轨迹**」
+4. **历史简报** → 刷新历史 → 点某条记录的「**查看简报正文**」看完整 Markdown
+5. **历史简报** → 点「**查看 Agent 工具调用轨迹**」看这次模型实际选了哪些工具、什么顺序
 
 ---
 
@@ -153,7 +158,7 @@ load_preferences → search_news → generate_digest → send_email
 | `read_file(path)` | 读取项目内文件（**拒绝 .env 等敏感文件**） |
 | `search_content(keyword, dir)` | 目录内关键词全文搜索（自动跳过敏感文件） |
 | `write_file(path, content)` | 写入文件，目录自动创建 |
-| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 |
+| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件 |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
 | `search_news(query, max_results)` | 检索新闻，四级降级：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
@@ -165,10 +170,11 @@ load_preferences → search_news → generate_digest → send_email
 
 1. **Tavily API** —— 通用 AI 搜索，配合 `NEWS_QUERY_SUFFIX` 引导出新闻而非百科；支持域名黑名单（YouTube/B站/抖音等视频平台）
 2. **Bing Web Search API** —— Tavily 未配置或失败时回退
-3. **RSS** —— 机器之心 / 量子位 / InfoQ 三个中文科技媒体源
-4. **兜底数据** —— 全部失败时保证功能不中断
+3. **RSS** —— 机器之心 / 量子位 / InfoQ 三个中文科技媒体源（带 10 秒超时，源站不响应不会挂死）
+4. **兜底示例数据** —— 全部失败时返回占位数据，**每条都带 `is_mock=true` 与显著提示**，简报开头由代码强制加"本次未获取到真实新闻"的声明，不会被当成当天真实新闻推送
 
 质量过滤两层：域名黑名单 + LLM 相关性打分（分数低于 `RELEVANCE_THRESHOLD`，默认 6 的丢弃，不足时按分数补齐）。
+打分是**一次批量调用**给最多 10 篇一起评分，而不是每篇调一次模型。
 
 ### 推送到哪
 
@@ -185,8 +191,14 @@ load_preferences → search_news → generate_digest → send_email
 | `preferences` | 用户偏好（单用户，`id=1`） | `topics` / `keywords`（JSON）、`language`、`max_articles` |
 | `digests` | 历史简报 | `digest_date`、`summary`、`content`、`trace_id`、`source` |
 | `tool_calls` | Agent 工具调用轨迹 | `trace_id`、`step`、`tool_name`、`arguments`、`result` |
+| `job_runs` | 定时任务执行记录 | 主键 `(name, run_date)`，充当原子锁，保证多 worker 下一天只发一次 |
+
+历史简报按 `created_at` 倒序只保留最近 30 条，清理时会**连带删除**对应的
+`tool_calls` 轨迹，避免轨迹表无界增长。
 
 SQLite 版本见 `db/schema_sqlite.sql`，两者字段一致，由 `db.py` 统一封装（`%s` 占位符在 SQLite 分支自动替换为 `?`）。
+建表脚本由 `db._split_sql_statements()` 拆句后逐条执行——PyMySQL 默认**没有**开启
+`CLIENT.MULTI_STATEMENTS`，整段脚本一次性丢给驱动会在第一条语句后报 1064。
 
 切换数据库只需改环境变量：
 
@@ -207,7 +219,7 @@ MYSQL_DATABASE=ai_news_agent
 | --- | --- | --- |
 | GET | `/api/preferences` | 获取偏好 |
 | POST | `/api/preferences` | 保存偏好 |
-| POST | `/api/generate` | 提交生成任务，返回 `task_id`（后台执行） |
+| POST | `/api/generate` | 提交生成任务，返回 `task_id`（后台执行）；已有任务在跑时返回 `409` |
 | GET | `/api/generate/{task_id}` | 轮询任务状态与结果 |
 | POST | `/api/preview` | 快速预览（不走 Agent，不发邮件） |
 | GET | `/api/history` | 历史简报列表 |
@@ -232,6 +244,7 @@ ai-news-agent/
 │   ├── schema_mysql.sql  # MySQL 建表脚本
 │   └── schema_sqlite.sql # SQLite 建表脚本
 ├── tools/
+│   ├── security.py       # 统一的路径沙箱与敏感文件识别（file_tools / shell_tools 共用）
 │   ├── file_tools.py     # list_dir / read_file / write_file / search_content
 │   ├── shell_tools.py    # bash（受限）
 │   ├── search_tools.py   # 新闻检索（四级降级）
@@ -246,11 +259,23 @@ ai-news-agent/
 
 ## 六、安全设计
 
-- **密钥**：全部走环境变量，`.env` 不入版本库，扫描确认无硬编码
-- **文件工具**：相对路径解析 + 越界校验（`..` 逃不出项目根目录）；`.env`、`*.key`、`*.pem` 等敏感文件**禁止读写**
-- **Shell 工具**：命令白名单；危险 token 按**单词边界**匹配（避免 `term` 被误判成 `rm`）；禁止管道/重定向/变量展开；工作目录锁定在项目根目录；普通命令不经 shell 执行
-- **接口**：`/api/trace/{id}` 返回的工具入参与结果均已截断，避免超长上下文与信息泄露
+- **密钥**：全部走环境变量（`os.getenv`），`.env` 已 gitignore 且从未进入任何一次提交，仓库内只有 `.env.example` 模板
+- **路径沙箱**：所有文件工具路径先 `resolve()` 再用 `Path.is_relative_to()` 判断祖先目录。
+  不用字符串前缀比较——项目目录是 `ai-news-agent` 时，同级目录 `ai-news-agent-BACKUP`
+  也以该前缀开头，前缀比较会把它误判为"项目内"（已实测并修正）
+- **敏感文件**：`.env` / `*.key` / `*.pem` / `credentials` / `id_rsa` 等**在文件工具与 shell 工具两个入口都被拒绝**，
+  名单统一维护在 `tools/security.py`（早期只有 `read_file` 拦截，`bash("cat .env")` 能绕过）。
+  模板文件 `.env.example` 显式放行
+- **Shell 工具**：命令白名单；危险 token 按**单词边界**匹配（避免 `term` 被误判成 `rm`）；
+  禁止管道/重定向/变量展开；工作目录锁定在项目根目录；普通命令不经 shell 执行；
+  命令中出现敏感文件引用（含 `type .env*` 通配符、`python -c "open('.env')"` 内嵌写法）会被拒绝
+- **兜底数据**：模拟新闻带 `is_mock` 标记且简报强制加声明，不会被伪装成真实新闻推送
+- **接口**：`/api/trace/{id}` 返回的工具入参与结果均已截断；未知 `/api/*` 返回 404 JSON 而不会回退成 HTML
 - **CORS**：开发环境放开，生产建议改为指定来源
+
+> **已知边界（如实说明）**：`bash` 白名单里有 `python`，而 `python -c "..."` 本质上等同于任意代码执行，
+> 无法靠命令白名单彻底封堵。这里做的是"阻止模型顺手读到密钥"的低成本防护；
+> 若要真正隔离，应把 shell 工具放到容器/沙箱中执行，或直接不把 `python` 放进白名单。
 
 ---
 
@@ -267,3 +292,26 @@ QQ/163 等邮箱要用**授权码**而不是登录密码；465 端口走 SSL，5
 
 **想只看推送不想每天真发？**
 把 `.env` 里的 `SCHEDULE_TIME` 改成任意时间即可；或者直接注掉 SMTP 配置，Agent 会跳过发送步骤（它自己判断的）。
+
+**用 `uvicorn --workers 4` 会不会一天发 4 封邮件？**
+不会。每个 worker 都会起一个 APScheduler，但 `run_scheduled_digest()` 会先用
+`job_runs` 表按 `(name, run_date)` 抢占当天执行权，只有第一个进程真正执行。
+更规范的做法是把调度拆出去：
+
+```bash
+# Web 进程关闭内置调度器
+set ENABLE_SCHEDULER=false && uvicorn app:app --workers 4
+# 另起一个进程专门跑定时任务
+python scheduler.py
+```
+
+**简报里出现了"兜底示例数据"字样？**
+说明 Tavily / Bing 都没配、三个 RSS 源也都没取到内容（国内不挂代理时很常见）。
+按提示配上 `TAVILY_API_KEY` 即可；这是刻意设计的——宁可明确告诉用户"没取到真实新闻"，
+也不把编造的内容当新闻发出去。
+
+**单次生成的模型调用次数？**
+1 次搜索打分（批量）+ 若干轮 Agent 决策 + 1 次简报生成，通常 1–3 分钟。`/api/generate` 是异步接口，前端轮询即可。
+
+**已知取舍**：为了保持"零额外依赖"，`db.py` 每次操作新建连接，没有引入连接池。
+在单用户、低并发场景下开销可忽略；若要上量，建议换成 `SQLAlchemy` + 连接池。
