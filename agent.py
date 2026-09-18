@@ -19,7 +19,7 @@ from tools.file_tools import (
     load_preferences,
 )
 from tools.shell_tools import bash
-from tools.search_tools import search_news
+from tools.search_tools import search_news, window_start
 from tools.digest_tools import generate_digest
 from tools.email_tools import send_email
 import db
@@ -156,7 +156,9 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "search_news",
             "description": (
-                "根据查询词搜索 AI 新闻，返回新闻列表。"
+                "根据查询词搜索新闻，只返回最近发布的新闻（默认只看今天），"
+                "每条带 date（真实发布日期）与 date_verified（日期是否经来源确认）。"
+                "返回空列表表示今天确实没有检索到符合条件的新闻。"
                 "若返回条目带 is_mock=true，表示所有真实来源均不可用、"
                 "这是兜底示例数据而非真实新闻，不得作为新闻使用。"
             ),
@@ -229,9 +231,19 @@ SYSTEM_PROMPT = """你是一名每日新闻助手 Agent。
 如果你认为某一步没必要（例如用户没配邮箱就没必要发邮件，或偏好文件可信但也可能需要确认），请自行决定跳过。
 只有在确实缺少必要信息时才继续调用工具，避免无效的重复调用。
 
+时效要求（重要）：
+- 你的简报是「今日简报」，只允许使用**今天发布**的新闻。search_news 已经按时间窗口做了过滤，
+  但你必须自己再核一遍每条素材的 date 字段：date 不是今天的，不要放进今日简报。
+- date_verified=false 表示该条目的发布时间无法从来源确认。这类条目不能当作"今日新闻"陈述，
+  如果你确实要用，必须在简报里注明"发布时间未确认"。
+- 如果 search_news 返回空列表，说明今天确实没有检索到符合条件的新闻。这时必须如实告诉用户
+  "今天未检索到符合条件的新闻"，并说明可以如何调整（例如放宽关注范围、调整时效窗口配置）。
+  **绝对不要用旧新闻、示例数据或自己编造的内容来凑数。**
+
 交付物约定：
 - 最终答案必须是中文；即使工具返回或思考过程中出现英文，返回给用户的每一句都必须是中文。
 - 先给一句简明的执行摘要（说明你做了什么、用了哪些工具），然后空一行，再附上完整的 Markdown 简报内容。
+- 简报里每条新闻都必须标注发布日期与来源，方便用户核对时效。
 - 如果某个环节失败，如实说明失败在哪一步以及原因，不要伪造结果。
 - 如果 search_news 返回的条目带 is_mock=true，说明所有真实新闻源都没取到，这是兜底示例数据而不是真实新闻。
   这种情况下不要把它当作今日新闻发出，应当明确告诉用户「未获取到真实新闻」并说明可能的排查方向
@@ -412,9 +424,17 @@ def generate_and_send_digest(trace_id: str = "") -> Dict[str, Any]:
     """
     trace_id = trace_id or uuid.uuid4().hex[:12]
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # 把当前生效的时效窗口明确告诉模型，避免它自己"宽限"到旧闻
+    start = window_start()
+    window_hint = (
+        f"{start.strftime('%Y-%m-%d')} 至 {today} 期间发布" if start else "不限发布时间"
+    )
+
     # 只描述目标，不规定步骤：步骤、工具组合、调用次数和停止时机由模型自己决定
     task = (
         f"今天是 {today}。请为当前用户完成今日 AI 新闻简报："
+        f"只采用{window_hint}的新闻，更早的旧闻一律不要；"
         "让简报尽可能贴合这位用户关注的方向，并按可行的途径把简报送到用户手上。"
         "完成后用中文回报：先一句执行摘要，再空一行附上完整的 Markdown 简报。"
     )

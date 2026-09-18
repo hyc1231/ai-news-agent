@@ -51,6 +51,8 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 | `SCHEDULE_TIME` / `TIMEZONE` | 每天几点推送，默认 `08:00` `Asia/Shanghai` | 用默认值 |
 | `ENABLE_SCHEDULER` | 是否在 Web 进程内跑定时任务，默认 `true` | 用默认值；多 worker 部署时设 `false` |
 | `DB_TYPE` 等 | 数据库配置，默认 `sqlite` | 用 SQLite 兜底 |
+| `NEWS_MAX_AGE_DAYS` | **时效窗口**：只推送最近 N 天内发布的新闻，默认 `1`（只看今天） | 用默认值。设为 `2` 表示今天+昨天，`7` 表示近一周，`0` 表示不做时间过滤 |
+| `NEWS_STRICT_DATE` | 发布时间无法确认的条目如何处理，默认 `false` | 默认保留并标注「发布时间未确认」；设 `true` 则一律丢弃，只保留能确认发布时间的新闻 |
 | `LLM_MAX_RETRIES` / `LLM_TIMEOUT` / `LLM_RETRY_BACKOFF` | 模型调用重试与超时 | 默认重试 2 次、超时 60s、退避 1.5s |
 
 > 密钥**只**通过环境变量读取（全部经 `os.getenv`），代码中不含任何硬编码密钥，`.env` 已被 `.gitignore` 排除。
@@ -161,21 +163,48 @@ load_preferences → search_news → generate_digest → send_email
 | `write_file(path, content)` | 写入文件，目录自动创建 |
 | `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件 |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
-| `search_news(query, max_results)` | 检索新闻，四级降级：Tavily → Bing → RSS → 兜底数据 |
+| `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤），降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
 | `send_email(subject, content, to_email)` | SMTP 推送（465 SSL / 587 STARTTLS） |
 
 ### 新闻从哪来
 
-`search_tools.py` 实现四级降级，保证任何环境下都能出结果：
+`search_tools.py` 合并多个真实来源后统一收口，保证任何环境下都有结果可给：
 
-1. **Tavily API** —— 通用 AI 搜索，配合 `NEWS_QUERY_SUFFIX` 引导出新闻而非百科；支持域名黑名单（YouTube/B站/抖音等视频平台）
-2. **Bing Web Search API** —— Tavily 未配置或失败时回退
-3. **RSS** —— 机器之心 / 量子位 / InfoQ 三个中文科技媒体源（带 10 秒超时，源站不响应不会挂死）
-4. **兜底示例数据** —— 全部失败时返回占位数据，**每条都带 `is_mock=true` 与显著提示**，简报开头由代码强制加"本次未获取到真实新闻"的声明，不会被当成当天真实新闻推送
+1. **Tavily API** —— 使用 **`topic="news"`**（不是 `general`）。这点很关键：`general` 主题**不返回发布日期**，
+   结果里混着年鉴、月报、百科等旧内容；`news` 主题才提供 `published_date`，
+   并能用 `days` 参数从源头限定回溯天数；同时保留域名黑名单（YouTube/B站/抖音等视频平台）
+2. **Bing News Search API** —— Tavily 未配置或失败时回退，用 `freshness` 限定时间范围、`sortBy=Date` 按发布时间倒序
+3. **RSS** —— 量子位 / InfoQ / 雷峰网 / 钛媒体 四个中文科技媒体源（带 10 秒超时，源站不响应不会挂死）
+4. **兜底示例数据** —— 全部源都不可用时才返回占位数据，**每条都带 `is_mock=true` 与显著提示**，
+   简报开头由代码强制加"本次未获取到真实新闻"的声明，不会被当成当天真实新闻推送
 
-质量过滤两层：域名黑名单 + LLM 相关性打分（分数低于 `RELEVANCE_THRESHOLD`，默认 6 的丢弃，不足时按分数补齐）。
-打分是**一次批量调用**给最多 10 篇一起评分，而不是每篇调一次模型。
+#### 时效是硬约束，不靠模型自觉
+
+「每日简报」只允许用**当天发布**的新闻 —— 这一条由代码保证，而不是写在提示词里指望模型遵守：
+
+- **取真实日期**：Tavily 读 `published_date`、Bing 读 `datePublished`、RSS 读 `published_parsed`。
+  **任何来源拿不到日期时不再用当前时间顶替**（旧版本正是这么做的，后果是把几个月前的回顾文章标成"今天"），
+  而是留空并标记 `date_verified=false`
+- **按本地时区换算**：窗口边界按 `TIMEZONE`（默认 `Asia/Shanghai`）计算。
+  RSS 的 `published_parsed` 是 UTC，若直接取日期，一条 `UTC 20:00` 的新闻（北京次日 04:00）
+  会被误算成昨天而错误丢弃，所以统一先转成本地时区再比较
+- **窗口过滤**：发布时间超出 `NEWS_MAX_AGE_DAYS`（默认 `1` = 只看今天）的条目直接丢弃
+- **空结果就说空**：真实源可用、只是窗口内没有新闻时返回**空列表**，Agent 会如实告知
+  "今天未检索到符合条件的新闻"，不会用旧闻或编造内容凑数；
+  只有所有源都不可用，才走带 `is_mock` 标记的示例数据兜底
+
+#### 质量过滤
+
+- **域名黑名单** —— 视频平台与社交平台（YouTube / B站 / 抖音 / Facebook / Threads 等帖子页）
+  不作为新闻来源，从搜索请求和结果两侧同时排除
+- **LLM 相关性打分** —— 各来源的候选**合并去重后统一打分**（最多 12 条，一次批量调用），
+  而不是每篇调一次模型；分数达标（`>= RELEVANCE_THRESHOLD`，默认 6）的排前面，
+  其余仅在数量不足时用于补齐，不会因为"打分偏低"就把当天的新闻全丢掉
+
+> 为什么强调"统一打分"：Tavily 候选带 0-10 的 LLM 分数、RSS 候选只有 0-3 的关键词命中数，
+> 两者直接比较时量纲不一致，结果是优质的 RSS 中文新闻被无差别挤掉，
+> 简报里反而混进不相关的英文报道。现在所有来源共用同一把尺子。
 
 ### 推送到哪
 
@@ -248,7 +277,7 @@ ai-news-agent/
 │   ├── security.py       # 统一的路径沙箱与敏感文件识别（file_tools / shell_tools 共用）
 │   ├── file_tools.py     # list_dir / read_file / write_file / search_content
 │   ├── shell_tools.py    # bash（受限）
-│   ├── search_tools.py   # 新闻检索（四级降级）
+│   ├── search_tools.py   # 新闻检索（多源合并 + 时效窗口过滤）
 │   ├── digest_tools.py   # 简报生成
 │   └── email_tools.py    # 邮件推送
 ├── frontend/index.html   # 单页前端
@@ -307,9 +336,21 @@ python scheduler.py
 ```
 
 **简报里出现了"兜底示例数据"字样？**
-说明 Tavily / Bing 都没配、三个 RSS 源也都没取到内容（国内不挂代理时很常见）。
+说明 Tavily / Bing 都没配、四个 RSS 源也都没取到内容（国内不挂代理时很常见）。
 按提示配上 `TAVILY_API_KEY` 即可；这是刻意设计的——宁可明确告诉用户"没取到真实新闻"，
 也不把编造的内容当新闻发出去。
+
+**为什么今天的简报只有两三条，甚至说"今天未检索到符合条件的新闻"？**
+这是时效过滤在正常工作。默认配置下只采用**当天发布**的新闻（`NEWS_MAX_AGE_DAYS=1`），
+而一天之内 AI 领域的新闻本来就不多，条数少于 `max_articles` 属正常现象。
+想放宽就在 `.env` 里改成 `NEWS_MAX_AGE_DAYS=2`（今天+昨天）或 `7`（近一周）；
+如果连一条都没有，那确实就是当天没有检索到符合关注方向的新闻，不建议放宽到用旧闻填充。
+
+**怎么确认简报里的新闻真的都是今天的？**
+搜索结果的每条都带 `date`（按 `TIMEZONE` 换算后的真实发布日期）与 `date_verified`
+（`false` 表示发布时间无法从来源确认）。
+在「历史简报」里点「查看 Agent 工具调用轨迹」能看到 `search_news` 的原始返回，
+每条都带日期，可以直接核对。
 
 **单次生成的模型调用次数？**
 1 次搜索打分（批量）+ 若干轮 Agent 决策 + 1 次简报生成，通常 1–3 分钟。`/api/generate` 是异步接口，前端轮询即可。

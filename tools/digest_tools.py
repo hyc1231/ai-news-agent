@@ -3,6 +3,7 @@
 """
 
 import json
+from datetime import datetime
 from typing import List, Dict, Any
 
 from llm import chat
@@ -54,6 +55,7 @@ def generate_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) -> 
     )
 
     user_prompt = f"""
+今天是：{datetime.now().strftime("%Y-%m-%d")}
 用户关注话题：{topics}
 用户关注关键词：{keywords}
 期望语言：{lang_hint}
@@ -68,6 +70,10 @@ def generate_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) -> 
 3. 整体控制在 {max_articles} 条以内，按用户关注的重要性和时效性排序。
 4. 语言为{lang_hint}。
 5. 如果新闻素材与用户关注话题不相关，请明确指出并只挑选最相关的内容。
+6. 每条新闻都必须标注发布日期与来源（格式如「2026-09-18 · 量子位」）。
+7. 素材里 date_verified 为 false 的条目，发布时间未经来源确认，必须注明「发布时间未确认」。
+8. 这是「今日简报」，只采用发布日期为今天的素材；如果素材里没有今天的新闻，
+   直接说明「今天未检索到符合条件的新闻」，不要用旧闻或编造内容填充。
 """
 
     messages = [
@@ -95,8 +101,15 @@ def _fallback_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) ->
     lines.append("# 每日新闻简报\n")
     lines.append(f"## 关注话题：{', '.join(preferences.get('topics', []))}\n")
     for idx, item in enumerate(news[: preferences.get("max_articles", 5)], start=1):
+        published = item.get("date")
+        if published and item.get("date_verified") is False:
+            date_text = f"{published}（未确认）"
+        elif published:
+            date_text = published
+        else:
+            date_text = "发布时间未确认"
         lines.append(f"### {idx}. {item['title']}")
-        lines.append(f"- 来源：{item['source']} | 日期：{item.get('date', '')}")
+        lines.append(f"- 来源：{item['source']} | 发布日期：{date_text}")
         lines.append(f"- 摘要：{item['summary']}")
         lines.append(f"- 链接：{item['url']}\n")
     return "\n".join(lines)
