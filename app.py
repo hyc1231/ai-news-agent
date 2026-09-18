@@ -88,6 +88,11 @@ TASKS: Dict[str, Dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
 MAX_TASKS = 50
 
+# 单飞锁：一次只允许跑一个生成任务。
+# 否则连点几次按钮 / 多标签页并发就会同时跑多个 Agent，
+# 既浪费 token，也可能把同一份简报写好几次。
+_generation_lock = threading.Lock()
+
 
 def _run_generate_task(task_id: str):
     """后台线程：调用 Agent 生成简报，成功则写入历史（并关联工具调用轨迹）。"""
@@ -114,13 +119,27 @@ def _run_generate_task(task_id: str):
             "finished_at": datetime.now().isoformat(),
         }
 
+    # 无论成功失败都要释放单飞锁，否则后续请求会被永久拒绝
+    if _generation_lock.locked():
+        try:
+            _generation_lock.release()
+        except RuntimeError:
+            pass
+
 
 @app.post("/api/generate")
 def generate_digest_endpoint(background_tasks: BackgroundTasks):
     """
     提交“生成今日简报”任务后立即返回 task_id。
     Agent 在后台自主执行（可能耗时 1-3 分钟），前端轮询 /api/generate/{task_id} 取结果。
+    已有任务在跑时返回 409，避免并发重复生成。
     """
+    if not _generation_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="已有生成任务正在执行，请等待其完成后再试",
+        )
+
     task_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     with _tasks_lock:
@@ -198,7 +217,15 @@ if os.path.isdir(frontend_dir):
 
     @app.get("/{full_path:path}")
     def serve_frontend(full_path: str):
-        """未匹配到 API 路由时，返回前端 index.html。"""
+        """
+        未匹配到路由时返回前端 index.html（单页应用的前端路由回退）。
+
+        但 /api 前缀必须排除：否则 GET /api/definitely-not-a-route 会返回
+        200 + HTML，前端拿它当 JSON 解析必然报错，问题会被掩盖。
+        """
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"接口不存在: /{full_path}")
+
         index_path = os.path.join(frontend_dir, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path)

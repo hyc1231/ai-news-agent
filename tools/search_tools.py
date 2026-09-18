@@ -7,6 +7,7 @@
 4. 模拟新闻库（兜底，保证功能不中断）
 """
 
+import json
 import os
 import re
 from datetime import datetime
@@ -58,28 +59,38 @@ RSS_SOURCES = [
     {"name": "InfoQ", "url": "https://www.infoq.cn/feed"},
 ]
 
-# 模拟新闻库：所有真实源都失败时的兜底数据
+# 模拟新闻库：所有真实源都失败时的兜底数据。
+# 注意：这里的内容是编造的示例，不是真实新闻。每条都带 is_mock 标记，
+# search_news 会把它一路带到模型上下文，让模型知道「这是兜底示例，不能当新闻发」，
+# 而不是像以前那样伪装成当天真实新闻直接发到用户邮箱。
+_MOCK_MARKER = "⚠️ 兜底示例数据，非真实新闻，不得作为新闻呈现或推送"
 _MOCK_NEWS_DB = [
     {
-        "title": "OpenAI 发布 GPT-5 预览版，多模态能力再升级",
-        "source": "机器之心",
-        "summary": "OpenAI 今日公布 GPT-5 预览版，支持更长的上下文窗口和原生图像理解。",
+        "title": "（示例）大模型多模态能力升级",
+        "source": "示例数据源",
+        "summary": "这是一条用于保证流程不中断的占位示例，不代表任何真实事件。",
         "url": "https://example.com/news/1",
         "tags": ["OpenAI", "大模型", "多模态"],
+        "is_mock": True,
+        "note": _MOCK_MARKER,
     },
     {
-        "title": "Google Gemini 2.0 实测：代码生成准确率提升 15%",
-        "source": "InfoQ",
-        "summary": "Gemini 2.0 在多项代码基准测试中超过前代，开发者工具链集成更紧密。",
+        "title": "（示例）代码生成模型基准表现提升",
+        "source": "示例数据源",
+        "summary": "这是一条用于保证流程不中断的占位示例，不代表任何真实事件。",
         "url": "https://example.com/news/2",
         "tags": ["Google", "Gemini", "代码生成"],
+        "is_mock": True,
+        "note": _MOCK_MARKER,
     },
     {
-        "title": "DeepSeek 开源新版 67B 模型，推理成本下降 30%",
-        "source": "量子位",
-        "summary": "DeepSeek 开源 67B 参数模型，在数学推理和代码任务上表现优异。",
+        "title": "（示例）开源模型推理成本下降",
+        "source": "示例数据源",
+        "summary": "这是一条用于保证流程不中断的占位示例，不代表任何真实事件。",
         "url": "https://example.com/news/3",
         "tags": ["DeepSeek", "开源", "大模型"],
+        "is_mock": True,
+        "note": _MOCK_MARKER,
     },
 ]
 
@@ -109,41 +120,48 @@ def _is_blocked_url(url: str) -> bool:
     return False
 
 
-def _llm_judge_relevance(query: str, article: Dict[str, Any]) -> int:
+def _llm_score_articles(query: str, articles: List[Dict[str, Any]]) -> List[int]:
     """
-    用 LLM 判断文章与查询词的相关性，返回 0-10 的整数分数。
-    失败时返回中间值 5，避免误删。
+    一次性给多篇文章打相关性分数，返回与 articles 等长的 0-10 分数列表。
+
+    以前是「每篇文章单独调一次模型」，一次简报最多要额外 10 次调用，
+    现在合并成 1 次批量调用，延迟和 token 成本都大幅下降。
+    解析失败时返回全 5（等价于“不筛选”），宁可保留也不误删。
     """
-    title = article.get("title", "")
-    summary = article.get("summary", "")
+    if not articles:
+        return []
 
-    prompt = f"""请判断下面这篇新闻与用户查询的相关程度。
+    numbered = []
+    for idx, article in enumerate(articles, start=1):
+        title = article.get("title", "")
+        summary = article.get("summary", "")
+        numbered.append(f'{idx}. 标题：{title}\n   摘要：{summary}')
 
-用户查询：{query}
-
-新闻标题：{title}
-新闻摘要：{summary}
-
-请只返回一个 0-10 的整数分数：
-- 10：非常相关，完全匹配用户查询主题
-- 5：部分相关，提到了相关概念但不是核心内容
-- 0：完全不相关
-
-只返回数字，不要任何解释。"""
+    prompt = (
+        "请判断下列新闻与用户查询的相关程度，逐条给出 0-10 的整数分数。\n\n"
+        f"用户查询：{query}\n\n"
+        + "\n".join(numbered)
+        + "\n\n评分标准：10 非常相关；5 部分相关；0 完全不相关。\n"
+        "只返回一个 JSON 数组，长度与条目数一致，元素为整数，不要任何解释。"
+        "例如：[8, 3, 10]"
+    )
 
     try:
         result = chat([{"role": "user", "content": prompt}], temperature=0.1)
         if result.get("error"):
-            return 5
+            return [5] * len(articles)
 
-        content = result.get("content", "5") or "5"
-        match = re.search(r"\b(\d{1,2})\b", content)
-        if match:
-            score = int(match.group(1))
-            return min(max(score, 0), 10)
+        content = result.get("content") or ""
+        match = re.search(r"\[[^\]]*\]", content)
+        if not match:
+            return [5] * len(articles)
+
+        scores = json.loads(match.group(0))
+        if not isinstance(scores, list) or len(scores) != len(articles):
+            return [5] * len(articles)
+        return [min(max(int(score), 0), 10) for score in scores]
     except Exception:
-        pass
-    return 5
+        return [5] * len(articles)
 
 
 def _search_tavily(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
@@ -200,10 +218,11 @@ def _search_tavily(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         if not articles:
             return []
 
-        # 第二步：用 LLM 给前 10 条打分，保留相关性 >= 阈值的文章
+        # 第二步：用 LLM 给前 10 条打分（一次批量调用），保留相关性 >= 阈值的文章
+        candidates = articles[:10]
+        scores = _llm_score_articles(query, candidates)
         scored_articles = []
-        for article in articles[:10]:
-            score = _llm_judge_relevance(query, article)
+        for article, score in zip(candidates, scores):
             article["relevance_score"] = score
             if score >= RELEVANCE_THRESHOLD:
                 scored_articles.append(article)
@@ -270,10 +289,23 @@ def _search_bing(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
 
 
 def _fetch_rss(source: Dict[str, str], timeout: int = 10) -> List[Dict[str, Any]]:
-    """抓取单个 RSS 源，返回标准化的新闻条目列表。"""
+    """
+    抓取单个 RSS 源，返回标准化的新闻条目列表。
+
+    这里先用 requests 带超时下载，再交给 feedparser 解析：
+    feedparser.parse(url) 自身不接受超时参数，源站不响应时会一直挂住，
+    定时任务和 HTTP 请求都可能被拖死。
+    """
     articles = []
     try:
-        feed = feedparser.parse(source["url"], request_headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(
+            source["url"],
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; ai-news-agent/1.0)"},
+        )
+        if resp.status_code != 200:
+            return articles
+        feed = feedparser.parse(resp.content)
         if feed.get("bozo") and not feed.get("entries"):
             return articles
 
@@ -282,6 +314,8 @@ def _fetch_rss(source: Dict[str, str], timeout: int = 10) -> List[Dict[str, Any]
             link = entry.get("link", "").strip()
             summary_raw = entry.get("summary", "") or entry.get("description", "")
             summary = _truncate(_clean_html(summary_raw))
+            published = entry.get("published") or entry.get("updated") or ""
+            date = published[:10] if published[:10].count("-") == 2 else datetime.now().strftime("%Y-%m-%d")
 
             if not title or not link:
                 continue
@@ -292,7 +326,7 @@ def _fetch_rss(source: Dict[str, str], timeout: int = 10) -> List[Dict[str, Any]
                 "summary": summary or title,
                 "url": link,
                 "tags": [],
-                "date": datetime.now().strftime("%Y-%m-%d"),
+                "date": date,
             })
     except Exception:
         pass
@@ -326,7 +360,7 @@ def _filter_by_query(articles: List[Dict[str, Any]], query_terms: List[str], max
 
 
 def _mock_search(query_terms: List[str], max_results: int) -> List[Dict[str, Any]]:
-    """兜底：从模拟新闻库中按关键词筛选。"""
+    """兜底：从模拟新闻库中按关键词筛选（返回结果均带 is_mock 标记）。"""
     scored = []
     for article in _MOCK_NEWS_DB:
         text = f"{article['title']} {article['summary']} {' '.join(article['tags'])}".lower()
@@ -342,6 +376,8 @@ def _mock_search(query_terms: List[str], max_results: int) -> List[Dict[str, Any
     today = datetime.now().strftime("%Y-%m-%d")
     for r in results:
         r["date"] = today
+        r["is_mock"] = True          # 明确标记，避免被当成当天真实新闻
+        r["note"] = _MOCK_MARKER
     return results
 
 
@@ -353,7 +389,9 @@ def search_news(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         query: 搜索关键词或主题，多个词用空格分隔
         max_results: 最多返回几条
     返回:
-        匹配的新闻列表，每条包含 title/source/summary/url/tags/date
+        匹配的新闻列表，每条包含 title/source/summary/url/tags/date。
+        ⚠️ 当所有真实来源都失败、走兜底模拟数据时，每条会带 is_mock=true 与 note 字段，
+        调用方必须把它当作占位示例而不是真实新闻（不得写入简报或推送）。
     """
     query_terms = [q.strip().lower() for q in query.split() if q.strip()]
     if not query_terms:

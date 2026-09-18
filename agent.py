@@ -155,7 +155,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_news",
-            "description": "根据查询词搜索 AI 新闻，返回新闻列表",
+            "description": (
+                "根据查询词搜索 AI 新闻，返回新闻列表。"
+                "若返回条目带 is_mock=true，表示所有真实来源均不可用、"
+                "这是兜底示例数据而非真实新闻，不得作为新闻使用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -225,6 +229,9 @@ SYSTEM_PROMPT = """你是一名每日新闻助手 Agent。
 - 最终答案必须是中文；即使工具返回或思考过程中出现英文，返回给用户的每一句都必须是中文。
 - 先给一句简明的执行摘要（说明你做了什么、用了哪些工具），然后空一行，再附上完整的 Markdown 简报内容。
 - 如果某个环节失败，如实说明失败在哪一步以及原因，不要伪造结果。
+- 如果 search_news 返回的条目带 is_mock=true，说明所有真实新闻源都没取到，这是兜底示例数据而不是真实新闻。
+  这种情况下不要把它当作今日新闻发出，应当明确告诉用户「未获取到真实新闻」并说明可能的排查方向
+  （例如检查 TAVILY_API_KEY、网络与代理设置）；是否仍要发送邮件由你判断，但绝不能省略这一说明。
 
 安全约束：
 - 不要读取、打印或修改密钥文件（如 .env），也不要输出任何密钥、口令。
@@ -276,8 +283,20 @@ def _execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         "tool_call_id": call_id,
         "role": "tool",
         "name": function_name,
+        # arguments 只用于本地落库（记录轨迹），发给模型前会被剔除：
+        # OpenAI 规范里 tool 消息只允许 role/content/tool_call_id（+name），
+        # 多余字段容易被严格实现的服务端拒绝。
         "arguments": arguments if isinstance(arguments, dict) else {},
         "content": content,
+    }
+
+
+def _to_tool_message(tool_result: Dict[str, Any]) -> Dict[str, Any]:
+    """把内部工具结果转成符合 OpenAI 规范的 tool 消息（剔除自定义字段）。"""
+    return {
+        key: tool_result[key]
+        for key in ("role", "tool_call_id", "name", "content")
+        if key in tool_result
     }
 
 
@@ -338,8 +357,19 @@ def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[s
             "tool_calls": tool_calls,
         })
 
-        # 如果模型没有调用工具，说明它认为可以收工了——停止由模型决定
+        # 如果模型没有调用工具，说明它认为可以收工了——停止由模型决定。
+        # 但如果是被 max_tokens 截断的，不能当成最终答案，要让模型接着说完。
         if not tool_calls:
+            if result.get("truncated"):
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "你上一条回复因长度限制被截断了。请不要重复已输出的内容，"
+                        "直接接着把剩余部分输出完整；若确实太长，请压缩到能一次输出完的长度。"
+                    ),
+                })
+                continue
+
             final_answer = ensure_chinese(content or "（模型未返回内容）")
             _persist_trace(trace_id, trace)
             return {
@@ -355,7 +385,7 @@ def run_agent(task: str, max_iterations: int = 10, trace_id: str = "") -> Dict[s
         for tc in tool_calls:
             tool_result = _execute_tool_call(tc)
             tool_results.append(tool_result)
-            messages.append(tool_result)
+            messages.append(_to_tool_message(tool_result))
 
         trace[-1]["tool_results"] = tool_results
 
@@ -385,7 +415,6 @@ def generate_and_send_digest(trace_id: str = "") -> Dict[str, Any]:
         "完成后用中文回报：先一句执行摘要，再空一行附上完整的 Markdown 简报。"
     )
     result = run_agent(task, trace_id=trace_id)
-    if result.get("answer"):
-        result["answer"] = ensure_chinese(result["answer"])
+    # run_agent 内部已调用过 ensure_chinese，这里不再重复调用（避免对同一文本跑两遍）
     result["trace_id"] = trace_id
     return result

@@ -76,6 +76,17 @@
             padding: 8px;
             white-space: pre-wrap;
         }
+        .digest-panel {
+            display: none;
+            margin-top: 8px;
+            font-size: 13px;
+            background: #f8f9fa;
+            border-left: 3px solid #1a73e8;
+            padding: 10px;
+            white-space: pre-wrap;
+            max-height: 420px;
+            overflow: auto;
+        }
         .trace-panel .trace-item { padding: 3px 0; }
         .trace-panel span { color: #888; }
         .loading { color: #1a73e8; }
@@ -273,11 +284,16 @@
                         <div class="history-date">${item.date || ""} ${item.created_at || ""}
                             ${item.source === "scheduled" ? " · 定时任务" : ""}</div>
                         <div>${escapeHtml(item.summary || "")}</div>
-                        ${item.trace_id
-                            ? `<div class="btn-group"><button class="secondary trace-btn"
-                                onclick="showTrace('${item.trace_id}', this)">查看 Agent 工具调用轨迹</button></div>
-                               <div class="trace-panel"></div>`
-                            : ""}
+                        <div class="btn-group">
+                            <button class="secondary trace-btn" data-action="digest"
+                                    data-id="${escapeHtml(item.id || "")}">查看简报正文</button>
+                            ${item.trace_id
+                                ? `<button class="secondary trace-btn" data-action="trace"
+                                          data-id="${escapeHtml(item.trace_id)}">查看 Agent 工具调用轨迹</button>`
+                                : ""}
+                        </div>
+                        <div class="digest-panel"></div>
+                        <div class="trace-panel" style="display:none"></div>
                     </div>
                 `).join("");
             } catch (e) {
@@ -285,18 +301,64 @@
             }
         }
 
-        // 展示某次运行里 LLM 实际选择的工具调用顺序
-        async function showTrace(traceId, btn) {
-            const panel = btn.parentElement.nextElementSibling;
+        // 历史记录里的按钮统一用事件委托，避免把 id 拼进 onclick 字符串
+        document.getElementById("historyList").addEventListener("click", (e) => {
+            const btn = e.target.closest("button[data-action]");
+            if (!btn) return;
+            const item = btn.closest(".history-item");
+            if (!item) return;
+            const id = btn.getAttribute("data-id") || "";
+            if (btn.getAttribute("data-action") === "digest") {
+                showDigest(id, item.querySelector(".digest-panel"), btn);
+            } else {
+                showTrace(id, item.querySelector(".trace-panel"), btn);
+            }
+        });
+
+        // 查看完整简报正文：列表里只渲染了摘要，正文需要按 id 单独请求
+        async function showDigest(digestId, panel, btn) {
             if (!panel) return;
+            if (panel.dataset.loaded === "1") {
+                panel.style.display = panel.style.display === "none" ? "block" : "none";
+                return;
+            }
+            panel.style.display = "block";
+            panel.textContent = "加载中...";
+            btn.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/history/${encodeURIComponent(digestId)}`);
+                if (!res.ok) {
+                    const detail = await res.json().catch(() => ({}));
+                    panel.textContent = "加载简报失败：" + (detail.detail || res.status);
+                    return;
+                }
+                const data = await res.json();
+                panel.textContent = data.content || data.summary || "（该简报没有正文）";
+                panel.dataset.loaded = "1";
+            } catch (e) {
+                panel.textContent = "加载简报失败：" + e.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // 展示某次运行里 LLM 实际选择的工具调用顺序
+        async function showTrace(traceId, panel, btn) {
+            if (!panel) return;
+            if (panel.dataset.loaded === "1") {
+                panel.style.display = panel.style.display === "none" ? "block" : "none";
+                return;
+            }
+            panel.style.display = "block";
             panel.innerHTML = "加载中...";
             btn.disabled = true;
             try {
-                const res = await fetch(`${API_BASE}/trace/${traceId}`);
+                const res = await fetch(`${API_BASE}/trace/${encodeURIComponent(traceId)}`);
                 const data = await res.json();
                 const steps = data.steps || [];
                 if (steps.length === 0) {
                     panel.innerHTML = "<i>本次运行没有工具调用记录。</i>";
+                    panel.dataset.loaded = "1";
                     return;
                 }
                 panel.innerHTML = steps.map((s, i) => `
@@ -305,6 +367,7 @@
                         <span>入参：</span>${escapeHtml(s.arguments || "")}
                     </div>
                 `).join("");
+                panel.dataset.loaded = "1";
             } catch (e) {
                 panel.innerHTML = "加载轨迹失败：" + e.message;
             } finally {
