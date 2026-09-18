@@ -7,7 +7,10 @@ Shell 命令工具。为了安全，只允许执行白名单内的只读/低风�
 2. 危险 token 按“单词边界”匹配（而不是子串），避免把 term、format_table 等
    正常词汇误判为 rm / format；
 3. 尽量不经过 shell 执行；确需 shell 的内建命令（dir / echo / type 等）
-   才交给 cmd /d /c，且此时已禁止所有管道、重定向与变量符号。
+   才交给 cmd /d /c，且此时已禁止所有管道、重定向与变量符号；
+4. 命令中不得出现敏感文件（.env / *.key / *.pem 等）——
+   否则 cat .env 就能绕过 file_tools 的敏感文件保护，把密钥读进模型上下文。
+   敏感文件名单与 file_tools 共用 tools/security.py，避免两处不一致。
 """
 
 import locale
@@ -16,7 +19,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from tools.security import PROJECT_ROOT, find_sensitive_reference
 
 # 允许执行的命令白名单（第一个 token 必须命中）
 ALLOWED_COMMANDS = (
@@ -60,6 +63,14 @@ def _check_safety(cmd: str) -> str:
     program = Path(tokens[0]).name.lower()
     if program not in ALLOWED_COMMANDS:
         return f"命令不在允许列表内，已被拒绝: {cmd}"
+
+    # 命令中不得引用敏感文件（cat .env / type .env* / python -c "open('.env')"）
+    sensitive = find_sensitive_reference(cmd)
+    if sensitive:
+        return (
+            f"命令引用了敏感文件（含密钥/口令），已被拒绝: {sensitive}。"
+            "如需了解配置项，请读取 .env.example 模板文件。"
+        )
 
     # 按单词边界匹配危险 token（形如 rm -rf 的第一个参数）
     for token in tokens[1:]:

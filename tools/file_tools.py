@@ -9,37 +9,16 @@ from pathlib import Path
 from typing import Union, List, Dict, Any
 
 import db
+from tools.security import (
+    PROJECT_ROOT,
+    SEARCH_SKIP_DIRS,
+    is_sensitive as _is_sensitive,
+    safe_path as _safe_path,
+)
 
-# 项目根目录：ai-news-agent 文件夹
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 项目根目录：ai-news-agent 文件夹（PROJECT_ROOT 由 tools.security 统一定义）
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
-
-
-# 含敏感信息的文件：工具应拒绝读取，避免密钥/口令进入模型上下文
-SENSITIVE_FILE_NAMES = {
-    ".env", ".env.local", ".env.production", ".env.development",
-    ".npmrc", ".pypirc", ".netrc", "credentials", "id_rsa", "id_dsa",
-}
-SENSITIVE_SUFFIXES = {".env", ".key", ".pem", ".pfx", ".p12", ".keystore", ".jks"}
-
-
-def _is_sensitive(target: Path) -> bool:
-    """判断目标是否为敏感文件（含密钥、口令等）。"""
-    name = target.name.lower()
-    if name in SENSITIVE_FILE_NAMES:
-        return True
-    # 形如 xxx.env / xxx.pem 这类后缀敏感文件
-    return any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES)
-
-
-def _safe_path(path: str) -> Path:
-    """把相对路径解析为项目根目录下的绝对路径，防止 .. 跳出项目。"""
-    target = (PROJECT_ROOT / path).resolve()
-    # 确保目标路径仍在项目根目录内
-    if not str(target).startswith(str(PROJECT_ROOT)):
-        raise ValueError(f"路径越界，不允许访问项目根目录之外: {path}")
-    return target
 
 
 def _read_guard(path: str) -> Path:
@@ -56,7 +35,10 @@ def list_dir(path: str = "") -> str:
     参数 path 为相对项目根目录的路径，空字符串表示项目根目录。
     返回文件和子目录列表，每项标注 [FILE] 或 [DIR]。
     """
-    target = _safe_path(path) if path else PROJECT_ROOT
+    try:
+        target = _safe_path(path) if path else PROJECT_ROOT
+    except ValueError as e:
+        return str(e)
     if not target.exists():
         return f"目录不存在: {path}"
     if not target.is_dir():
@@ -116,14 +98,19 @@ def search_content(keyword: str, dir: str = "") -> str:
     只搜索文本文件（.txt, .md, .json, .py, .html, .js, .css），
     会跳过 .env 等含密钥的敏感文件，返回匹配的文件路径和行号列表。
     """
-    target_dir = _safe_path(dir) if dir else PROJECT_ROOT
+    try:
+        target_dir = _safe_path(dir) if dir else PROJECT_ROOT
+    except ValueError as e:
+        return str(e)
     if not target_dir.exists() or not target_dir.is_dir():
         return f"目录不存在: {dir}"
 
     text_exts = {".txt", ".md", ".json", ".py", ".html", ".js", ".css", ".example"}
     matches = []
     try:
-        for root, _, files in os.walk(target_dir):
+        for root, dirnames, files in os.walk(target_dir):
+            # 原地剪枝：跳过依赖/缓存目录，避免爬进 .venv 等海量无关文件
+            dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS and not d.startswith(".")]
             for name in files:
                 file_path = Path(root) / name
                 if Path(name).suffix.lower() not in text_exts:
