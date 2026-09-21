@@ -14,7 +14,9 @@ Shell 命令工具。为了安全，只允许执行白名单内的只读/低风�
 5. 命令里的路径参数必须落在项目目录内，复用同一个 security.safe_path()。
    这一条是补出来的：只挡敏感文件名并不能阻止 `cat C:\\Windows\\win.ini`
    把项目外的任意文件读进上下文，而新闻正文是**不可信输入**，
-   一段藏在网页里的提示词就足以诱导模型去读它；
+   一段藏在网页里的提示词就足以诱导模型去读它。
+   判定跨平台一致：绝对路径（盘符 / UNC / 前导 `/`）一律拒绝，项目内引用写相对路径；
+   切词前先把反斜杠归一化成正斜杠，否则 Linux 下 `..\\..\\..` 会被 shlex 吃掉反斜杠而失效。
 6. 白名单里**不含任何解释器**（python / pip / uvicorn / pytest 等）。
    这是本模块安全模型的关键一环：只要还能执行任意代码，第 4、5 条就会被绕过——
    write_file 写一个脚本，再用 bash 运行它，就能读到 .env 全文或项目外文件。
@@ -74,6 +76,36 @@ def _looks_like_path(token: str) -> bool:
     return any(ch in token for ch in ("/", "\\"))
 
 
+def _path_tokens(cmd: str) -> list[str]:
+    """
+    按「路径检查」的视角切分命令：先把反斜杠统一成正斜杠，再按 POSIX 规则切词。
+
+    为什么要先归一化 —— 两个宿主差异会让判定结果不一致：
+    1. Windows 上 shlex 保留 `\\`，Linux（posix=True）把 `\\` 当转义符吃掉：
+       `dir ..\\..\\..` 在 Linux 上被切成 `......`，这条命令**连「像路径」都不成立**，
+       路径沙箱被整体绕开（CI 就是挂在这里，实测复现过）；
+    2. POSIX 下 `C:/Windows/win.ini` 会被当相对路径 join 进项目根，
+       从而被误判成「项目内」，而它在 Windows 上是绝对路径。
+    归一化后两端切出同一串 token，判定才能跨平台一致。
+    security.find_sensitive_reference() 出于同样的原因也先做 replace("\\\\", "/")。
+    """
+    try:
+        return shlex.split(cmd.replace("\\", "/"), posix=True)
+    except ValueError:
+        return []
+
+
+def _is_absolute_like(token: str) -> bool:
+    """
+    判断是不是「绝对路径写法」：POSIX 的 `/xxx`、UNC 的 `\\\\srv\\share`、Windows 盘符 `C:...`。
+
+    不依赖 os.name，也不要求路径真实存在 —— 项目内引用一律写相对路径就够用了。
+    """
+    if token.startswith("/"):
+        return True
+    return len(token) > 1 and token[1] == ":"  # 盘符：C:\... / C:/... / C:foo
+
+
 def _check_paths(tokens) -> str:
     """
     路径沙箱：命令里出现的路径参数必须落在项目目录内。
@@ -82,10 +114,20 @@ def _check_paths(tokens) -> str:
     能把宿主机上任意文件读进模型上下文（实测确认过）。而新闻正文是**不可信输入**
     且会进模型上下文，一段藏在网页里的提示词就足以诱导模型去读它。
     file_tools 一直有这层边界（走 security.safe_path），shell 侧漏了，现在复用同一份实现。
+
+    两条规则，都不依赖宿主系统（Windows 与 Linux 结论一致）：
+    1. 绝对路径一律拒绝（盘符 / UNC / 前导 `/`）。想读项目内文件就写相对路径——
+       这样判定不需要知道宿主是什么系统，也回避了 `C:` 盘符相对路径的歧义；
+    2. 其余路径交给 security.safe_path() 做真实祖先目录判断，
+       `..\\..\\` 这类上跳会被算出来并拒绝（前缀相同的同级目录也挡得住）。
+
+    tokens 由 _path_tokens() 产出（反斜杠已归一化）。
     """
     for token in tokens[1:]:
         if not _looks_like_path(token):
             continue
+        if _is_absolute_like(token):
+            return f"命令访问了项目目录之外的路径（路径越界），已被拒绝: {token}"
         try:
             safe_path(token)
         except ValueError:
@@ -122,8 +164,10 @@ def _check_safety(cmd: str) -> str:
             "如需了解配置项，请读取 .env.example 模板文件。"
         )
 
-    # 路径参数必须在项目目录内（cat C:\Windows\win.ini 这类要挡住）
-    path_reason = _check_paths(tokens)
+    # 路径参数必须在项目目录内（cat C:\Windows\win.ini 这类要挡住）。
+    # 用归一化后的 token 做判定：反斜杠先转正斜杠，避免 Windows / Linux 切词不一致
+    # 导致 Linux 上 `..\..\..` 被吃掉反斜杠、整条规则失效。
+    path_reason = _check_paths(_path_tokens(cmd) or tokens)
     if path_reason:
         return path_reason
 

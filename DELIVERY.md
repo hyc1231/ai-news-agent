@@ -11,7 +11,7 @@
 
 **可交付**，定位是「单机运行的每日 AI 新闻助手」。
 
-- 作为课程作业 / 面试作品 / 个人项目：**达标**，并且配有 142 项完全离线的自动化测试 + GitHub Actions CI。
+- 作为课程作业 / 面试作品 / 个人项目：**达标**，并且配有 153 项完全离线的自动化测试 + GitHub Actions CI。
 - 作为生产系统：**不够**，缺口已在 [README 第八节「已知限制」](#已知限制) 中逐条列出。
 
 ---
@@ -104,7 +104,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-**结果**：`142 passed`，约 7 秒。
+**结果**：`153 passed`，约 3–7 秒。
 
 测试是**完全离线**的：网络请求与模型调用全部打桩，不需要 API Key、不消耗额度、不会真发邮件；
 数据库强制切到临时目录下的 SQLite，既不碰本机 MySQL，也不污染仓库里的 `data/`。
@@ -136,7 +136,7 @@ SELECT id, source, created_at FROM digests WHERE source = 'scheduled';
 | 项 | 现状 |
 | --- | --- |
 | shell 工具白名单 | 只保留只读查看命令（`git` / `ls` / `cat` / `find` 等），**已移除全部解释器**，堵死「写脚本再执行」这条 RCE 路径 |
-| shell 路径沙箱 | 命令中的路径参数必须落在项目目录内，复用 `security.safe_path()`。此前 shell 侧缺这层边界，`cat C:\Windows\win.ini` 可读项目外任意文件（实测确认）——已补上：6 组越界路径全部拦截，8 组项目内只读命令零误伤 |
+| shell 路径沙箱 | 命令中的路径参数必须落在项目目录内，复用 `security.safe_path()`。此前 shell 侧缺这层边界，`cat C:\Windows\win.ini` 可读项目外任意文件（实测确认）——已补上：14 组越界/绝对路径全部拦截，8 组项目内只读命令零误伤。判定跨平台一致：绝对路径写法（盘符 / UNC / 前导 `/`）一律拒绝，切词前先把反斜杠归一化——否则 Linux 上 `shlex.split(posix=True)` 会吃掉 `..\..\..` 的反斜杠、沙箱被整体绕开（CI 第一版就是这样挂在 ubuntu 上的） |
 | 文件工具 | 拒绝敏感文件（`.env` 等）；路径越界校验；`.env.example` 可读而 `.env` 不可读 |
 | 敏感文件引用识别 | 覆盖 `.env`、`./.env`、`../.env`、`dir/.env`、`.ssh/id_rsa` 等**带路径前缀**的写法；14 组判定实测全对，正常文件（`README.md` / `.env.example`）无误伤 |
 | 收件人白名单 | `send_email` 只允许发往 `preferences.email` 或 `DEFAULT_RECIPIENT`，其余地址一律拒绝。收件人原本完全由模型给出，而新闻正文是**不可信输入**、会进模型上下文——不设限时网页里藏一段提示词即可诱导 Agent 把简报发到任意第三方地址。读库失败时保守退化为只允许 `DEFAULT_RECIPIENT`，不放开 |

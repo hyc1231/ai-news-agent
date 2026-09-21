@@ -200,7 +200,7 @@ load_preferences → search_news → generate_digest → send_email
 | `read_file(path)` | 读取项目内文件（**拒绝 .env 等敏感文件**） |
 | `search_content(keyword, dir)` | 目录内关键词全文搜索（自动跳过敏感文件） |
 | `write_file(path, content)` | 写入文件，目录自动创建 |
-| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 拒绝引用敏感文件 + **路径沙箱**（路径参数必须落在项目目录内，复用 `security.safe_path()`）；**白名单不含任何解释器**（`python` / `pip` / `uvicorn` / `pytest` 均不在列） |
+| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 拒绝引用敏感文件 + **路径沙箱**（路径参数必须落在项目目录内，只接受相对路径，绝对路径/UNC 一律拒绝，复用 `security.safe_path()`）；**白名单不含任何解释器**（`python` / `pip` / `uvicorn` / `pytest` 均不在列） |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
 | `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤 + 相关性筛选），`max_results` 为**上限**；降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
@@ -391,6 +391,10 @@ ai-news-agent/
   以及 `./.env` / `../.env` 这类带路径前缀的写法）会被拒绝
 - **Shell 路径沙箱**：命令里的路径参数必须落在项目目录内（`cat C:\Windows\win.ini`、`dir ..\..\..`
   这类会被拒绝），复用 `file_tools` 用的同一个 `security.safe_path()`。
+  判定**与宿主系统无关**：绝对路径写法（盘符 `C:\...`、UNC `\\srv\share`、前导 `/`）一律拒绝，
+  项目内文件请写相对路径；切词前先把反斜杠归一化成正斜杠 ——
+  否则 Linux 上 `shlex.split(posix=True)` 会把 `..\..\..` 反斜杠当转义符吃掉，
+  这类命令连「像路径」都不成立，沙箱会被整体绕开（CI 第一版就是这样挂在 ubuntu 上的）。
   这条是后补的：只挡敏感文件名挡不住「读项目外的文件」，而新闻正文是**不可信输入**且会进模型上下文
 - **白名单不含任何解释器**：`python` / `python3` / `py` / `pip` / `uvicorn` / `pytest` 都不在允许列表内。
   这条是安全模型的关键 —— 只拦"敏感文件名"是挡不住的：`write_file` 写一个脚本、再用 `bash` 运行它，

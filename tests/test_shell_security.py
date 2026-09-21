@@ -14,6 +14,7 @@ from tools.shell_tools import (
     ALLOWED_COMMANDS,
     _check_safety,
     _looks_like_path,
+    _path_tokens,
     bash,
 )
 
@@ -157,3 +158,54 @@ def test_plain_arguments_are_not_treated_as_paths(token):
 @pytest.mark.parametrize("token", [".", "..", "a/b", r"a\b", r"C:\x", "C:x", "/etc"])
 def test_path_like_arguments_are_detected(token):
     assert _looks_like_path(token)
+
+
+# --- 跨平台一致性 -----------------------------------------------------------
+#
+# 回归背景：CI 第一版挂在 Linux 上（同一份代码在 Windows 本地 142 项全绿）。
+# 两个宿主差异叠加，把路径沙箱整体绕开了：
+#   1. shlex.split(posix=True) 把反斜杠当转义符吃掉 —— `dir ..\..\..` 被切成 `......`，
+#      连「像路径」都不成立，_check_paths 直接跳过不判；
+#   2. POSIX 下 `C:/Windows/win.ini` 被当**相对路径** join 进项目根 —— 误判成「项目内」。
+# 下面这些用例都不依赖 os.name，所以 Windows 与 Linux 必须给出同一个结论。
+
+
+@pytest.mark.parametrize(
+    "cmd,expect",
+    [
+        (r"dir ..\..\..", ["dir", "../../.."]),
+        (r"type ..\..\..\Windows\win.ini", ["type", "../../../Windows/win.ini"]),
+        ("cat C:/Windows/win.ini", ["cat", "C:/Windows/win.ini"]),
+        ("ls tools", ["ls", "tools"]),
+    ],
+)
+def test_path_tokens_are_normalized(cmd, expect):
+    """切词前先把反斜杠归一化 —— 这是两个平台判定一致的前提。"""
+    assert _path_tokens(cmd) == expect
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        r"dir ..\..\..",
+        r"type ..\..\..\Windows\win.ini",
+        "cat C:/Windows/win.ini",
+        "cat //server/share/x.txt",  # UNC 写法
+        "cat C:foo.txt",  # 盘符相对写法
+        "head -c 100 C:/Windows/win.ini",
+    ],
+)
+def test_windows_style_paths_are_rejected_on_every_platform(cmd):
+    """Windows 写法在 Linux 宿主上同样要拦 —— CI 跑在 ubuntu-latest 上。"""
+    assert "越界" in bash(cmd), f"{cmd} 在非 Windows 宿主上被放行了"
+
+
+def test_absolute_path_inside_project_is_also_rejected():
+    """
+    项目内的绝对路径也一并拒绝：只放行相对路径，判定才不需要知道宿主系统。
+
+    代价是模型写绝对路径会被挡（拒绝语里让它改用相对路径），换来的是 Windows 与 Linux
+    结论完全一致 —— 否则「什么算项目内」会随部署环境变化而变，等于换机器就换一套边界。
+    """
+    absolute = (PROJECT_ROOT / "README.md").as_posix()
+    assert "越界" in bash(f"cat {absolute}")
