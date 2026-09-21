@@ -35,8 +35,13 @@ SEARCH_SKIP_DIRS = {
 # 在任意文本（含命令行）中识别敏感文件引用。
 # 既覆盖 cat .env 这种直接引用，也覆盖 python -c "open('.env')" 这类字符串内引用。
 # (?<![\w.-]) / (?![\w-]) 保证按边界匹配，不会把 mycompany.env.example 之类误伤。
+#
+# ⚠️ 前瞻断言里**不能把 `/` 也排除掉**：多排除一个字符，等于给所有
+# 「带路径前缀」的引用开绿灯 —— `cat ./.env`、`cat ../.env`、`.ssh/id_rsa`
+# 全部不命中（实测确认过）。Windows 上只是被 cmd 的 `type` 不接受正斜杠
+# 侥幸挡住，换到 Linux 部署就会直接读出密钥。
 _SENSITIVE_NAME_RE = re.compile(
-    r"(?<![\w.\-/])"
+    r"(?<![\w.\-])"
     r"(?:"
     r"\.env(?:\.[\w-]+)?"
     r"|[\w-]+\.(?:key|pem|pfx|p12|jks|keystore)"

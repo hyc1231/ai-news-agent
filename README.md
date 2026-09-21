@@ -198,7 +198,7 @@ load_preferences → search_news → generate_digest → send_email
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
 | `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤 + 相关性筛选），`max_results` 为**上限**；降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
-| `send_email(subject, content, to_email)` | SMTP 推送（465 SSL / 587 STARTTLS） |
+| `send_email(subject, content, to_email)` | SMTP 推送（465 SSL / 587 STARTTLS）；**只允许发往偏好里保存的收件人**，其余地址拒绝 |
 
 ### 新闻从哪来
 
@@ -366,7 +366,8 @@ ai-news-agent/
   模板文件 `.env.example` 显式放行
 - **Shell 工具**：命令白名单；危险 token 按**单词边界**匹配（避免 `term` 被误判成 `rm`）；
   禁止管道/重定向/变量展开；工作目录锁定在项目根目录；普通命令不经 shell 执行；
-  命令中出现敏感文件引用（含 `type .env*` 通配符、`python -c "open('.env')"` 内嵌写法）会被拒绝
+  命令中出现敏感文件引用（含 `type .env*` 通配符、`python -c "open('.env')"` 内嵌写法，
+  以及 `./.env` / `../.env` 这类带路径前缀的写法）会被拒绝
 - **白名单不含任何解释器**：`python` / `python3` / `py` / `pip` / `uvicorn` / `pytest` 都不在允许列表内。
   这条是安全模型的关键 —— 只拦"敏感文件名"是挡不住的：`write_file` 写一个脚本、再用 `bash` 运行它，
   就能把 `.env` 全文读进模型上下文，两个工具一组合就是完整的任意代码执行链路。
@@ -376,6 +377,13 @@ ai-news-agent/
   可选的 `API_KEY` 鉴权（`X-API-Key` 请求头），未配置时不启用
 - **CORS**：默认只允许本机来源（`http://127.0.0.1:8000` 与 `http://localhost:8000`），
   不再使用 `allow_origins=["*"]`；需要额外来源时用 `CORS_ORIGINS` 显式声明
+- **收件人白名单**：`send_email` 只允许发往用户在「设置」里保存过的邮箱（或 `.env` 的 `DEFAULT_RECIPIENT`），
+  其余地址一律拒绝。收件人原本完全由模型给出，而新闻正文是**不可信输入**、会被放进模型上下文——
+  抓到的网页里藏一段提示词就可能诱导 Agent 把简报发到任意第三方地址。读库失败时保守退化为
+  只允许 `DEFAULT_RECIPIENT`，而不是放开白名单
+- **AI 生成标识**：简报末尾由代码强制附加「本简报由 AI 自动生成」声明（跟随 `language` 切换中英文），
+  模型输出与模板兜底两条路径都会带上。这既是透明度要求，也让用户把简报转发到群/公众号时
+  天然满足「使用者发布生成合成内容应主动声明」的要求
 
 > **已知边界（如实说明）**：shell 工具很难同时做到"让模型能干活"和"绝对安全"。
 > 当前做了两条低成本但有效的收敛：① 移除全部解释器，堵死"写脚本再执行"这条绕过路径；

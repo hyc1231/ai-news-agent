@@ -10,6 +10,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
+from typing import Set
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,32 @@ FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USERNAME)
 DEFAULT_RECIPIENT = os.getenv("DEFAULT_RECIPIENT", "").strip()
 
 
+def allowed_recipients() -> Set[str]:
+    """
+    允许发送的收件人白名单：preferences.email ∪ DEFAULT_RECIPIENT。
+
+    为什么要加这一道：收件人原先完全由模型给出，而新闻正文是**不可信输入**、
+    会被塞进模型上下文 —— 抓到的网页里只要藏一段提示词，就可能诱导 Agent
+    把简报发到任意第三方地址。那既是「向未同意者发信」，也是一条把项目内容
+    带出去的外泄通道。
+
+    读库失败时**保守退化**为只允许 DEFAULT_RECIPIENT，而不是放开白名单。
+    """
+    allowed: Set[str] = set()
+    if DEFAULT_RECIPIENT:
+        allowed.add(DEFAULT_RECIPIENT.strip().lower())
+    try:
+        # 延迟导入：tools 层不必在模块导入期就绑定数据库配置
+        import db
+
+        email = (db.load_preferences() or {}).get("email", "") or ""
+        if email.strip():
+            allowed.add(email.strip().lower())
+    except Exception:
+        pass
+    return allowed
+
+
 def send_email(subject: str, content: str, to_email: str) -> str:
     """
     发送一封邮件。
@@ -35,6 +62,8 @@ def send_email(subject: str, content: str, to_email: str) -> str:
         to_email: 收件人邮箱，留空时回落到环境变量 DEFAULT_RECIPIENT
     返回:
         发送结果描述
+
+    只允许发往白名单内的地址（见 allowed_recipients），其余一律拒绝。
     """
     to_email = (to_email or "").strip()
     used_fallback = False
@@ -51,6 +80,15 @@ def send_email(subject: str, content: str, to_email: str) -> str:
         # 分开报错：原来统一报「缺少 SMTP 配置或收件人邮箱」，
         # 排查时分不清到底是哪一项没配。
         return "邮件发送失败：SMTP 配置不完整（需要 SMTP_SERVER / SMTP_USERNAME / SMTP_PASSWORD）"
+
+    # 白名单检查放在 SMTP 配置检查之后：SMTP 都没配时，
+    # 报「收件人非法」会把排查方向带偏。
+    if to_email.lower() not in allowed_recipients():
+        return (
+            f"邮件发送失败：收件人 {to_email} 不在允许列表内。"
+            "为避免简报被发到非订阅地址，只允许发送到用户在「设置」里保存的邮箱"
+            "（或 .env 的 DEFAULT_RECIPIENT）。"
+        )
 
     html_content = _markdown_to_html(content)
 

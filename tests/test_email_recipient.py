@@ -72,12 +72,46 @@ def test_whitespace_recipient_also_falls_back(configured):
     assert "fallback@test" in result
 
 
-def test_explicit_recipient_is_not_overridden(configured):
+def test_explicit_recipient_is_not_overridden(configured, monkeypatch):
+    """偏好里保存过的邮箱可以直接作收件人，不会被动成 DEFAULT_RECIPIENT。"""
+    monkeypatch.setattr(db, "load_preferences", lambda: {"email": "user@example.com"})
+
     result = email_tools.send_email("主题", "正文", "user@example.com")
 
     assert "user@example.com" in result
     assert "兜底" not in result
     assert configured.instances[-1].sent[-1]["to"] == ["user@example.com"]
+
+
+def test_recipient_outside_allowlist_is_refused(configured, monkeypatch):
+    """
+    收件人白名单：模型不能把简报发到任意地址。
+
+    收件人由模型给出、而新闻正文是不可信输入，没有这道限制时，
+    抓到的网页里藏一段提示词就能诱导 Agent 把内容发到第三方邮箱。
+    """
+    monkeypatch.setattr(db, "load_preferences", lambda: {"email": "user@example.com"})
+    _FakeSMTP.instances.clear()
+
+    result = email_tools.send_email("主题", "正文", "attacker@evil.com")
+
+    assert "失败" in result
+    assert "attacker@evil.com" in result
+    assert _FakeSMTP.instances == [], "白名单外的收件人不应尝试连接 SMTP"
+
+
+def test_allowlist_degrades_to_default_when_db_unavailable(configured, monkeypatch):
+    """读库失败时保守退化：只放开 DEFAULT_RECIPIENT，而不是放开白名单。"""
+
+    def _boom():
+        raise RuntimeError("database is down")
+
+    monkeypatch.setattr(db, "load_preferences", _boom)
+
+    assert email_tools.allowed_recipients() == {"fallback@test"}
+
+    result = email_tools.send_email("主题", "正文", "user@example.com")
+    assert "不在允许列表内" in result
 
 
 def test_both_empty_returns_actionable_error_without_sending(monkeypatch):

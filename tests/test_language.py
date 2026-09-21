@@ -103,6 +103,40 @@ def test_digest_prompt_requires_chinese_by_default(monkeypatch, news):
     assert "期望语言：中文" in prompt
 
 
+def test_digest_carries_ai_notice_in_chinese(monkeypatch, news):
+    """简报末尾必须带 AI 生成标识（对应生成合成内容标识的合规要求）。"""
+    monkeypatch.setattr(digest_tools, "chat", lambda messages, **kw: {"content": "# digest"})
+
+    out = digest_tools.generate_digest(
+        news, {"language": "zh", "topics": [], "keywords": [], "max_articles": 5}
+    )
+
+    assert out.rstrip().endswith(digest_tools.AI_NOTICE_ZH)
+    assert "AI 自动生成" in out
+
+
+def test_digest_carries_ai_notice_in_english(monkeypatch, news):
+    monkeypatch.setattr(digest_tools, "chat", lambda messages, **kw: {"content": "# digest"})
+
+    out = digest_tools.generate_digest(
+        news, {"language": "en", "topics": [], "keywords": [], "max_articles": 5}
+    )
+
+    assert out.rstrip().endswith(digest_tools.AI_NOTICE_EN)
+
+
+def test_fallback_digest_also_carries_ai_notice(monkeypatch, news):
+    """模型调用失败走模板兜底时标识不能漏——两条返回路径都要带上。"""
+    monkeypatch.setattr(digest_tools, "chat", lambda messages, **kw: {"error": "boom"})
+
+    out = digest_tools.generate_digest(
+        news, {"language": "zh", "topics": [], "keywords": [], "max_articles": 5}
+    )
+
+    assert "# 每日新闻简报" in out
+    assert "AI 自动生成" in out
+
+
 def test_generate_and_send_digest_passes_language_through(monkeypatch):
     """偏好里是 en 时，任务描述和 run_agent 的 language 参数都要跟着变成英文。"""
     seen = {}
