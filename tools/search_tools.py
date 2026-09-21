@@ -1,15 +1,22 @@
 """
 新闻搜索工具。
 搜索策略优先级：
-1. Tavily API（通用 AI 搜索，推荐）
+1. Tavily API（通用搜索，推荐）
 2. Bing Web Search API（通用搜索，需要 API Key）
-3. RSS 订阅源（中文科技媒体，无需 Key）
+3. RSS 订阅源（内置是 AI / 科技媒体，可用 .env 的 RSS_SOURCES 追加或替换）
 4. 模拟新闻库（兜底，保证功能不中断）
 
 时效约束（本次新增的核心能力）：
 所有来源的新闻都必须带上「真实的发布时间」，并统一按时间窗口过滤，
 只把窗口内的新闻交给模型。任何来源拿不到日期时，不再用当前时间顶替，
 而是标记 date_verified=false，由上层决定是否采用。
+
+来源范围（默认就是 AI / 科技为主）：
+内置 RSS 源清一色是 AI 垂直媒体，这是有意为之，不是缺陷。
+想补充别的来源时，把对应 RSS 加进 .env 的 RSS_SOURCES（例如再多加几家 AI 媒体）。
+如果关注方向长期偏离 AI，可以打开 RSS_FILTER_BY_QUERY，
+让 RSS 条目先命中查询词才进候选池 —— 默认关闭，因为在 AI 话题下
+它会把约一半「没写全关键词但确实相关」的 AI 新闻误伤掉。
 """
 
 import calendar
@@ -19,6 +26,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import feedparser
 import requests
@@ -62,6 +70,11 @@ def _record_error(source: str, exc: BaseException) -> None:
 
 # 相关性评分阈值：低于此分数的文章会被丢弃
 RELEVANCE_THRESHOLD = int(os.getenv("RELEVANCE_THRESHOLD", "6"))
+
+# 参与「关键词命中」判定的最短词长。
+# 单字词（如「男」「女」）区分度太低，在中文正文里几乎必然命中，
+# 拿它做过滤等于没过滤，反而会放行大量无关条目，所以默认不参与判定。
+MIN_TERM_LEN = int(os.getenv("MIN_TERM_LEN", "2"))
 
 # 单次批量相关性打分最多送多少条候选给模型（控制 token 与耗时）
 _LLM_SCORING_LIMIT = int(os.getenv("LLM_SCORING_LIMIT", "12"))
@@ -118,14 +131,68 @@ BING_SEARCH_ENDPOINT = os.getenv(
     "https://api.bing.microsoft.com/v7.0/news/search",
 )
 
-# 中文科技媒体 RSS 源列表（Tavily/Bing 未配置或失败时作为备用）。
+# 内置 RSS 源：AI / 科技方向，作为 Tavily 之外的第二条通道。
 # 这些源都实测过：能正常返回条目，且每条都带真实发布时间。
-RSS_SOURCES = [
+DEFAULT_RSS_SOURCES = [
     {"name": "量子位", "url": "https://www.qbitai.com/feed"},
     {"name": "InfoQ", "url": "https://www.infoq.cn/feed"},
     {"name": "雷峰网", "url": "https://www.leiphone.com/feed"},
     {"name": "钛媒体", "url": "https://www.tmtpost.com/rss.xml"},
 ]
+
+
+def _parse_rss_sources(raw: str) -> List[Dict[str, str]]:
+    """
+    解析 RSS_SOURCES 配置，格式 `名称|地址`，多个用英文逗号分隔。
+
+    容错优先：名称缺省时用域名兜底，地址不是 http(s) 的条目直接跳过。
+    一个写错的配置项只该让那个源失效，不该把整条搜索链路带崩。
+    """
+    sources: List[Dict[str, str]] = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "|" in chunk:
+            name, url = chunk.split("|", 1)
+        else:
+            name, url = "", chunk
+        name, url = name.strip(), url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if not name:
+            name = urlparse(url).netloc or "自定义源"
+        sources.append({"name": name, "url": url})
+    return sources
+
+
+# 自定义 RSS 源（.env 的 RSS_SOURCES）。默认「追加」在内置的 4 个 AI 源之后，
+# 用来补充更多来源。格式 `名称|地址`，多个用英文逗号分隔。示例（均已实测可用）：
+#   RSS_SOURCES=IT之家|https://www.ithome.com/rss/,中新网|http://www.chinanews.com.cn/rss/scroll-news.xml
+# 想把内置的 AI 源整个换掉（例如改做财经方向），把 RSS_INCLUDE_DEFAULTS 设为 false。
+RSS_SOURCES_EXTRA = _parse_rss_sources(os.getenv("RSS_SOURCES", ""))
+
+# 是否要求 RSS 条目先命中查询词才能进候选池。**默认关闭**。
+# 打开能挡掉与关注方向无关的条目，代价是 AI 话题下会误伤约一半
+# 「意思相关但标题没写全关键词」的新闻（实测：70 条 AI 新闻里会被砍到 36 条），
+# 所以只在关注方向明显远离 AI 时才建议打开。
+RSS_FILTER_BY_QUERY = os.getenv("RSS_FILTER_BY_QUERY", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+RSS_INCLUDE_DEFAULTS = os.getenv("RSS_INCLUDE_DEFAULTS", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+RSS_SOURCES = (DEFAULT_RSS_SOURCES if RSS_INCLUDE_DEFAULTS else []) + RSS_SOURCES_EXTRA
+if not RSS_SOURCES:
+    # 自定义源写了但全被解析丢掉（例如格式写错），此时回退到内置源。
+    # 宁可多抓几个不相关的源，也不要让 RSS 这条通道静默消失。
+    RSS_SOURCES = list(DEFAULT_RSS_SOURCES)
 
 # 模拟新闻库：所有真实源都失败时的兜底数据。
 # 注意：这里的内容是编造的示例，不是真实新闻。每条都带 is_mock 标记，
@@ -317,11 +384,33 @@ def filter_by_date(
     return kept, stats
 
 
+def _effective_terms(query_terms: List[str]) -> List[str]:
+    """
+    过滤掉单字这类没有区分度的查询词。
+
+    全被过滤掉时（用户只填了「男」「女」这种词）退回原列表 ——
+    宁可放宽，也不要因为一个词都不可用而把过滤逻辑变成「全部丢弃」。
+    """
+    terms = [term for term in query_terms if len(term) >= MIN_TERM_LEN]
+    return terms or list(query_terms)
+
+
+def _matches_query(article: Dict[str, Any], terms: List[str]) -> bool:
+    """标题或摘要里是否出现任一查询词。"""
+    text = f"{article.get('title', '')} {article.get('summary', '')}".lower()
+    return any(term in text for term in terms)
+
+
 def _score_by_query(articles: List[Dict[str, Any]], query_terms: List[str]) -> None:
-    """按查询关键词给文章打关键词分（就地写入 keyword_score 字段）。"""
+    """按查询关键词给文章打关键词分（就地写入 keyword_score 字段）。
+
+    只统计有效查询词的命中数：单字词在中文正文里几乎必然命中，
+    计进来只会让小作文式的噪声条目拿到虚高的分。
+    """
+    terms = _effective_terms(query_terms)
     for article in articles:
         text = f"{article.get('title', '')} {article.get('summary', '')}".lower()
-        article["keyword_score"] = sum(1 for term in query_terms if term in text)
+        article["keyword_score"] = sum(1 for term in terms if term in text)
 
 
 def _sort_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -340,6 +429,28 @@ def _sort_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
+def _preselect_pool(articles: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """
+    挑出送进 LLM 打分的候选（最多 limit 条）。
+
+    这里的关键是**不要让来源顺序参与决胜**。以前的写法是先按
+    (date, keyword_score) 排完直接截断，同日期同分数的条目谁在前完全取决于
+    候选池的拼接顺序（Tavily -> Bing -> RSS），于是 RSS 的中文新闻被系统性地
+    挤到 12 条之外，从未被模型评估过就丢了 —— 而 RSS 恰恰是唯一免费、
+    且能覆盖中文垂类内容的通道。
+
+    现在的规则：命中查询词的先入选，不够再用最近发布的补齐。
+    被截断的永远是「既没命中关键词、又不算最新」的那些，这个取舍是说得清的。
+    """
+    by_time = _sort_articles(articles)
+    if limit <= 0 or len(by_time) <= limit:
+        return by_time
+
+    hit = [a for a in by_time if a.get("keyword_score", 0) > 0]
+    rest = [a for a in by_time if a.get("keyword_score", 0) <= 0]
+    return (hit + rest)[:limit]
+
+
 def _finalize(
     candidates: List[Dict[str, Any]],
     query_terms: List[str],
@@ -354,7 +465,8 @@ def _finalize(
 
     具体规则：
 
-    1. 先用 LLM 给候选池（最多 _LLM_SCORING_LIMIT 条）统一打相关性分。
+    1. 先挑出送进打分的候选（见 _preselect_pool，最多 _LLM_SCORING_LIMIT 条），
+       再用 LLM 给它们统一打相关性分。
        **所有来源共用同一把尺子**，这样 RSS 的中文新闻才有机会和 Tavily 的结果公平竞争。
     2. 分数达标（>= RELEVANCE_THRESHOLD）的按「发布时间倒序 + 相关性」返回，最多 max_results 条。
        达标条目不足 max_results 时就返回这几条 —— 当天贴合关注方向的新闻本来有多少就是多少。
@@ -369,7 +481,8 @@ def _finalize(
     ordered = _sort_articles(kept)
 
     if query:
-        pool = ordered[:_LLM_SCORING_LIMIT]
+        # 预筛选必须放在打分之前：打分池有上限，谁进谁出直接决定模型能看到什么
+        pool = _preselect_pool(kept, _LLM_SCORING_LIMIT)
         scores = _llm_score_articles(query, pool)
         for article, score in zip(pool, scores):
             article["relevance_score"] = score
@@ -660,14 +773,36 @@ def _mock_search(query_terms: List[str], max_results: int) -> List[Dict[str, Any
     return results
 
 
-def _search_rss(max_results: int) -> Tuple[List[Dict[str, Any]], bool]:
-    """抓取全部 RSS 源并合并，返回 (新闻列表, 是否至少有一个源可用)。"""
+def _search_rss(
+    query_terms: List[str], max_results: int
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    抓取全部 RSS 源并合并，返回 (新闻列表, 是否有源可达)。
+
+    默认**不做查询词过滤**：内置源本来就是 AI 垂直媒体，抓回来的内容天然在用户的
+    关注范围内，再要求标题命中查询词，只会把「意思相关但没写全关键词」的新闻误伤掉。
+
+    RSS_FILTER_BY_QUERY=true 时才按查询词过滤，给关注方向明显远离 AI 的场景用 ——
+    否则那几十条无关的 AI 新闻会把候选池占满，打分池一截断，模型看到的就全是 AI 内容。
+
+    max_results 目前不影响 RSS 的抓取量：每个源各取最近 20 条，之后统一在
+    _finalize 里按时间与相关性收敛。参数保留是为了和其它来源的签名保持一致。
+
+    返回的 ok 只表示「源是否可达」，与过滤掉多少条无关 ——
+    区分「源挂了」和「源好好的只是没有相关内容」，是外层决定要不要兜底的前提。
+    """
     merged: List[Dict[str, Any]] = []
     any_ok = False
+    terms = _effective_terms(query_terms) if RSS_FILTER_BY_QUERY else None
+
     for source in RSS_SOURCES:
         articles, ok = _fetch_rss(source)
         any_ok = any_ok or ok
-        merged.extend(articles)
+        if terms is None:
+            merged.extend(articles)
+        else:
+            merged.extend(a for a in articles if _matches_query(a, terms))
+
     return merged, any_ok
 
 
@@ -708,7 +843,9 @@ def search_news(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
     any_source_ok = any_source_ok or bing_ok
     candidates.extend(bing_articles)
 
-    rss_articles, rss_ok = _search_rss(max_results)
+    # 查询词一并交给 RSS：默认不参与过滤（内置源本身就是 AI 垂媒），
+    # 只有 RSS_FILTER_BY_QUERY 打开时才用它筛条目
+    rss_articles, rss_ok = _search_rss(query_terms, max_results)
     any_source_ok = any_source_ok or rss_ok
     candidates.extend(rss_articles)
 

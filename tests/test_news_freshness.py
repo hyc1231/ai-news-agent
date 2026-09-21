@@ -130,7 +130,7 @@ def test_all_sources_down_falls_back_to_mock(monkeypatch, today_str):
     """所有真实源都不可用时才用示例数据兜底，且必须带 is_mock 标记。"""
     monkeypatch.setattr(st, "_search_tavily", lambda q, m: ([], False))
     monkeypatch.setattr(st, "_search_bing", lambda q, m: ([], False))
-    monkeypatch.setattr(st, "_search_rss", lambda m: ([], False))
+    monkeypatch.setattr(st, "_search_rss", lambda q, m: ([], False))
 
     out = st.search_news("大模型", max_results=5)
 
@@ -143,7 +143,7 @@ def test_live_sources_with_no_news_return_empty(monkeypatch):
     """源是通的、只是今天没有新闻 -> 必须返回空列表，而不是拿旧闻或示例数据凑数。"""
     monkeypatch.setattr(st, "_search_tavily", lambda q, m: ([], True))
     monkeypatch.setattr(st, "_search_bing", lambda q, m: ([], True))
-    monkeypatch.setattr(st, "_search_rss", lambda m: ([], True))
+    monkeypatch.setattr(st, "_search_rss", lambda q, m: ([], True))
 
     assert st.search_news("大模型", max_results=5) == []
 
@@ -154,6 +154,6 @@ def test_old_news_from_live_source_is_filtered_out(monkeypatch):
     monkeypatch.setattr(st, "NEWS_MAX_AGE_DAYS", 1)
     monkeypatch.setattr(st, "_search_tavily", lambda q, m: (list(old), True))
     monkeypatch.setattr(st, "_search_bing", lambda q, m: ([], True))
-    monkeypatch.setattr(st, "_search_rss", lambda m: ([], True))
+    monkeypatch.setattr(st, "_search_rss", lambda q, m: ([], True))
 
     assert st.search_news("大模型", max_results=5) == []
