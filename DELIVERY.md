@@ -109,8 +109,8 @@ pytest
 测试是**完全离线**的：网络请求与模型调用全部打桩，不需要 API Key、不消耗额度、不会真发邮件；
 数据库强制切到临时目录下的 SQLite，既不碰本机 MySQL，也不污染仓库里的 `data/`。
 
-覆盖范围：时效过滤与日期换算、`max_results` 上限语义、简报语言设置、收件人兜底、
-shell 白名单与路径沙箱、接口鉴权与数据库故障呈现。
+覆盖范围：时效过滤与日期换算、`max_results` 上限语义、简报语言设置、收件人兜底与白名单、
+shell 白名单与路径沙箱、简报 AI 生成标识、接口鉴权与数据库故障呈现。
 
 ### 5. 定时推送链路（端到端）
 
@@ -135,6 +135,9 @@ SELECT id, source, created_at FROM digests WHERE source = 'scheduled';
 | --- | --- |
 | shell 工具白名单 | 只保留只读查看命令（`git` / `ls` / `cat` / `find` 等），**已移除全部解释器**，堵死「写脚本再执行」这条 RCE 路径 |
 | 文件工具 | 拒绝敏感文件（`.env` 等）；路径越界校验；`.env.example` 可读而 `.env` 不可读 |
+| 敏感文件引用识别 | 覆盖 `.env`、`./.env`、`../.env`、`dir/.env`、`.ssh/id_rsa` 等**带路径前缀**的写法；14 组判定实测全对，正常文件（`README.md` / `.env.example`）无误伤 |
+| 收件人白名单 | `send_email` 只允许发往 `preferences.email` 或 `DEFAULT_RECIPIENT`，其余地址一律拒绝。收件人原本完全由模型给出，而新闻正文是**不可信输入**、会进模型上下文——不设限时网页里藏一段提示词即可诱导 Agent 把简报发到任意第三方地址。读库失败时保守退化为只允许 `DEFAULT_RECIPIENT`，不放开 |
+| AI 生成标识 | 简报末尾由代码强制附加「本简报由 AI 自动生成」，跟随 `language` 切换中英文；模型输出与模板兜底两条返回路径都覆盖 |
 | 密钥管理 | 全部经 `os.getenv` 读取，代码中无硬编码；`.env` 已被 `.gitignore` 排除，并确认未进入版本控制 |
 | 接口鉴权 | 可选的 `API_KEY`（`X-API-Key` 请求头 + `secrets.compare_digest`）；留空即不启用，本机零配置可用 |
 | CORS | 默认只允许本机来源，不使用 `allow_origins=["*"]` |
@@ -143,9 +146,9 @@ SELECT id, source, created_at FROM digests WHERE source = 'scheduled';
 
 | 项 | 值 |
 | --- | --- |
-| 受版本控制的文件 | 29 个 |
-| 提交历史 | 19 条，均为一行式标题 |
-| 交付包 | `ai-news-agent.zip`，206 条目 / 392.7 KB，**不含 `.env`**，含完整 `.git` |
+| 受版本控制的文件 | 32 个 |
+| 提交历史 | 23 条，均为一行式标题（无正文） |
+| 交付包 | `ai-news-agent.zip`，**不含 `.env`**，含完整 `.git`（条目数随提交历史增长，体积约 0.7 MB） |
 
 ---
 
