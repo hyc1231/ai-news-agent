@@ -36,12 +36,34 @@ ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").strip().lower() not in 
 
 
 def _parse_time(time_str: str):
-    """把 HH:MM 格式解析成小时和分钟。"""
+    """
+    把 HH:MM 格式解析成小时和分钟；无法解析或越界时回落到默认的 08:00。
+
+    为什么越界值也必须在这里兜住：本函数在**模块级**被调用（见文件末尾的
+    `_scheduler = get_scheduler()`），一旦上抛异常，`from scheduler import lifespan`
+    就会失败，进而整个 app 无法导入、服务完全起不来。而那个 traceback 会一路穿过
+    uvicorn / click / importlib，最外层信息完全不指向 SCHEDULE_TIME，用户极难定位。
+    所以宁可回落到默认时间并打一行警告，也要保证服务能正常启动。
+    """
     try:
         hour, minute = time_str.strip().split(":")
-        return int(hour), int(minute)
+        hour, minute = int(hour), int(minute)
     except Exception:
+        print(f"[警告] SCHEDULE_TIME={time_str!r} 无法解析为 HH:MM，已回落到 08:00")
         return 8, 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        print(
+            f"[警告] SCHEDULE_TIME={time_str!r} 超出范围"
+            f"（小时 0-23、分钟 0-59），已回落到 08:00"
+        )
+        return 8, 0
+    return hour, minute
+
+
+# 模块级解析一次，之后全程复用这两个值。
+# 原因：_parse_time 在配置非法时会打印回落警告，若每个使用点各自解析一遍，
+# 同一条警告会在启动日志里重复出现，看起来像是多个配置项都写错了。
+SCHEDULE_HOUR, SCHEDULE_MINUTE = _parse_time(SCHEDULE_TIME)
 
 
 def run_scheduled_digest(force: bool = False) -> None:
@@ -70,11 +92,10 @@ def run_scheduled_digest(force: bool = False) -> None:
 def get_scheduler() -> BackgroundScheduler:
     """创建并配置后台调度器。"""
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    hour, minute = _parse_time(SCHEDULE_TIME)
 
     scheduler.add_job(
         run_scheduled_digest,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
         id="daily_digest_job",
         name="每日新闻简报",
         replace_existing=True,
@@ -93,7 +114,13 @@ def start_scheduler():
         return
     if not _scheduler.running:
         _scheduler.start()
-        print(f"定时任务已启动：每天 {SCHEDULE_TIME}（{TIMEZONE}）自动生成简报")
+        # 打印**实际生效**的时间（而非 .env 里的原始字符串）：
+        # 配置越界时解析结果会回落到 08:00，若直接回显原始值，
+        # 日志就会与上一行的回落警告自相矛盾。
+        print(
+            f"定时任务已启动：每天 {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
+            f"（{TIMEZONE}）自动生成简报"
+        )
 
 
 def shutdown_scheduler():
@@ -111,16 +138,18 @@ def main() -> None:
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
-    hour, minute = _parse_time(SCHEDULE_TIME)
     blocking = BlockingScheduler(timezone=TIMEZONE)
     blocking.add_job(
         run_scheduled_digest,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
         id="daily_digest_job",
         name="每日新闻简报",
         replace_existing=True,
     )
-    print(f"定时任务已启动：每天 {SCHEDULE_TIME}（{TIMEZONE}），Ctrl+C 退出")
+    print(
+        f"定时任务已启动：每天 {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
+        f"（{TIMEZONE}），Ctrl+C 退出"
+    )
     try:
         blocking.start()
     except (KeyboardInterrupt, SystemExit):

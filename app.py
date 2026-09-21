@@ -42,6 +42,16 @@ app = FastAPI(title="每日新闻助手 Agent", lifespan=lifespan)
 # 启动时确保数据表存在（表已存在则无副作用）
 try:
     db.init_db()
+except ModuleNotFoundError as e:
+    # 最常见的成因：用系统 python 而不是项目虚拟环境启动，依赖没装齐（典型是 pymysql）。
+    # 必须和「数据库连不上」区分开 —— 否则会把人引去排查连接/密码/端口，
+    # 而真正该做的是换解释器或 pip install -r requirements.txt。
+    print(
+        f"[警告] 缺少依赖 {e.name}，数据库无法初始化（服务仍会启动，但所有接口都会失败）。\n"
+        f"        大概率是用错了 Python 解释器，请改用项目虚拟环境：\n"
+        f"        .\\.venv\\Scripts\\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000\n"
+        f"        或先补齐依赖：pip install -r requirements.txt"
+    )
 except Exception as e:  # 数据库不可用时仍允许服务启动，接口会返回明确错误
     print(f"[警告] 数据库初始化失败，请检查连接后执行 python migrate.py：{e}")
 
