@@ -52,7 +52,7 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 | `BING_SEARCH_KEY` | Bing 新闻搜索（可选） | 跳过 |
 | `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | 邮件推送 | Agent 会把简报直接返回而不发邮件 |
 | `DEFAULT_RECIPIENT` | 默认收件人 | 前端「设置」里没填邮箱时由它兜底；两边都空才发不出邮件 |
-| `SCHEDULE_TIME` / `TIMEZONE` | 每天几点推送，默认 `08:00` `Asia/Shanghai` | 用默认值 |
+| `SCHEDULE_TIME` / `TIMEZONE` | 每天几点推送，默认 `08:00` `Asia/Shanghai` | 用默认值。`TIMEZONE` 同时是**全项目唯一的时间基准**（见 `clock.py`）：简报日期、抢锁日期、写库时间、简报提示词里的「今天」都取自它，别只把它当成"调度时区" |
 | `ENABLE_SCHEDULER` | 是否在 Web 进程内跑定时任务，默认 `true` | 用默认值；多 worker 部署时设 `false` |
 | `DB_TYPE` 等 | 数据库配置，默认 `sqlite` | 用 SQLite 兜底 |
 | `NEWS_MAX_AGE_DAYS` | **时效窗口**：只推送最近 N 天内发布的新闻，默认 `1`（只看今天） | 用默认值。设为 `2` 表示今天+昨天，`7` 表示近一周，`0` 表示不做时间过滤 |
@@ -150,8 +150,10 @@ pytest                                # 全量测试
 测试是**完全离线**的：网络请求与模型调用全部打桩，不需要 API Key、不消耗额度、不会真发邮件；
 数据库强制切到临时目录下的 SQLite，既不碰本机 MySQL，也不污染仓库里的 `data/`。
 
-覆盖范围见 `tests/`：时效过滤与日期换算、`max_results` 上限语义、简报语言设置、
-收件人兜底、shell 白名单与路径沙箱、接口鉴权与数据库故障呈现。
+覆盖范围见 `tests/`：时效过滤与日期换算、全项目时间基准、`max_results` 上限语义、打分池入选顺序、
+简报语言设置、收件人兜底与白名单、shell 白名单与路径沙箱、接口鉴权与数据库故障呈现。
+
+同一套命令也跑在 CI 上（`.github/workflows/ci.yml`，push / PR 自动触发，无需配置任何 Secret）。
 
 ---
 
@@ -198,7 +200,7 @@ load_preferences → search_news → generate_digest → send_email
 | `read_file(path)` | 读取项目内文件（**拒绝 .env 等敏感文件**） |
 | `search_content(keyword, dir)` | 目录内关键词全文搜索（自动跳过敏感文件） |
 | `write_file(path, content)` | 写入文件，目录自动创建 |
-| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 限定工作目录 + 拒绝引用敏感文件；**白名单不含任何解释器**（`python` / `pip` / `uvicorn` / `pytest` 均不在列） |
+| `bash(command)` | 受限 shell：白名单 + 危险 token 边界匹配 + 禁管道/重定向 + 拒绝引用敏感文件 + **路径沙箱**（路径参数必须落在项目目录内，复用 `security.safe_path()`）；**白名单不含任何解释器**（`python` / `pip` / `uvicorn` / `pytest` 均不在列） |
 | `load_preferences()` | 读取用户订阅偏好（数据库） |
 | `search_news(query, max_results)` | 检索新闻（多源合并 + 时效窗口过滤 + 相关性筛选），`max_results` 为**上限**；降级链：Tavily → Bing → RSS → 兜底数据 |
 | `generate_digest(news, preferences)` | 生成 Markdown 简报 |
@@ -226,6 +228,11 @@ load_preferences → search_news → generate_digest → send_email
 - **按本地时区换算**：窗口边界按 `TIMEZONE`（默认 `Asia/Shanghai`）计算。
   RSS 的 `published_parsed` 是 UTC，若直接取日期，一条 `UTC 20:00` 的新闻（北京次日 04:00）
   会被误算成昨天而错误丢弃，所以统一先转成本地时区再比较
+- **全项目只有一个时间基准**：时区解析收口在 `clock.py`，`search_tools` / `db` / `agent` /
+  `digest_tools` / `app` / `scheduler` 全部从它取「现在」。四条写库语句
+  （`preferences.updated_at`、`digests.created_at`、`job_runs.started_at`、`tool_calls.created_at`）
+  也都显式传入时间戳，不再依赖数据库的 `CURRENT_TIMESTAMP` 默认值 —— 那个跟数据库服务器时区走，
+  换到 UTC 主机就会出现「新闻按北京日期筛选、简报的日期字段却按 UTC 写入」，跨零点整整差一天
 - **窗口过滤**：发布时间超出 `NEWS_MAX_AGE_DAYS`（默认 `1` = 只看今天）的条目直接丢弃
 - **空结果就说空**：真实源可用、只是窗口内没有新闻时返回**空列表**，Agent 会如实告知
   "今天未检索到符合条件的新闻"，不会用旧闻或编造内容凑数；
@@ -335,6 +342,7 @@ ai-news-agent/
 ├── agent.py              # ReAct 循环：工具注册、调用执行、轨迹记录
 ├── app.py                # FastAPI 后端：API 路由、异步任务、静态页托管
 ├── llm.py                # DeepSeek（OpenAI 兼容）客户端，支持 tool calling
+├── clock.py              # 全项目唯一的时间基准（时区解析 + local_now / local_today）
 ├── scheduler.py          # APScheduler 定时任务：每天定时生成并推送
 ├── db.py                 # 数据访问层（MySQL / SQLite 双支持）
 ├── migrate.py            # 迁移脚本：建表 + 旧 JSON 数据导入 + 自检
@@ -353,10 +361,13 @@ ai-news-agent/
 │   ├── conftest.py               # 强制 SQLite + 清空外部密钥 + 关定时任务
 │   ├── test_shell_security.py    # shell 白名单、路径沙箱、敏感文件
 │   ├── test_news_freshness.py    # 日期解析、时区换算、时效窗口
+│   ├── test_time_base.py         # 全项目时间基准唯一（不许再出现裸 datetime.now()）
+│   ├── test_source_pool.py       # 候选池构成与打分池入选顺序
 │   ├── test_max_articles_cap.py  # max_results 是上限而非目标
 │   ├── test_language.py          # 简报语言跟随用户偏好
 │   ├── test_email_recipient.py   # 收件人兜底、HTML 转义
 │   └── test_api.py               # 接口鉴权、数据库故障返回 500
+├── .github/workflows/ci.yml      # CI：push / PR 自动跑全量离线测试
 ├── pytest.ini
 ├── data/                 # SQLite 数据与运行时文件（已 gitignore）
 ├── requirements.txt
@@ -375,9 +386,12 @@ ai-news-agent/
   名单统一维护在 `tools/security.py`（早期只有 `read_file` 拦截，`bash("cat .env")` 能绕过）。
   模板文件 `.env.example` 显式放行
 - **Shell 工具**：命令白名单；危险 token 按**单词边界**匹配（避免 `term` 被误判成 `rm`）；
-  禁止管道/重定向/变量展开；工作目录锁定在项目根目录；普通命令不经 shell 执行；
+  禁止管道/重定向/变量展开；普通命令不经 shell 执行；
   命令中出现敏感文件引用（含 `type .env*` 通配符、`python -c "open('.env')"` 内嵌写法，
   以及 `./.env` / `../.env` 这类带路径前缀的写法）会被拒绝
+- **Shell 路径沙箱**：命令里的路径参数必须落在项目目录内（`cat C:\Windows\win.ini`、`dir ..\..\..`
+  这类会被拒绝），复用 `file_tools` 用的同一个 `security.safe_path()`。
+  这条是后补的：只挡敏感文件名挡不住「读项目外的文件」，而新闻正文是**不可信输入**且会进模型上下文
 - **白名单不含任何解释器**：`python` / `python3` / `py` / `pip` / `uvicorn` / `pytest` 都不在允许列表内。
   这条是安全模型的关键 —— 只拦"敏感文件名"是挡不住的：`write_file` 写一个脚本、再用 `bash` 运行它，
   就能把 `.env` 全文读进模型上下文，两个工具一组合就是完整的任意代码执行链路。
@@ -482,8 +496,8 @@ python scheduler.py
 | **错过的时间点不会补发** | APScheduler 用的是内存 job store，没有持久化。进程在 `SCHEDULE_TIME` 时刻没有运行（未启动 / 关机 / 崩溃），当天就真的不会推送，也不会补跑 | 增加「启动补跑」：进程启动时检查 `job_runs` 里今天是否已有记录，若没有且当前时间已过调度点就补跑一次。复用现成的 `claim_daily_run` 即可保证多进程下的幂等 |
 | **`misfire_grace_time` 是默认的 1 秒** | 这是 APScheduler 3.x 的默认值。若到点那一刻调度线程被占用、或进程卡顿超过 1 秒，该次任务会被判定为 misfire 直接跳过，只在日志里留一行警告 | 对「每日必发」而言容差偏紧。建议在 `add_job` 时显式设置 `misfire_grace_time=3600`（1 小时内晚到仍执行） |
 | **调度器是单机的** | 定时器跑在 Web 进程内的后台线程里。多 worker 部署时必须 `ENABLE_SCHEDULER=false`，并另起一个 `python scheduler.py` | 跨进程去重已经靠 `job_runs` 的主键冲突实现，但没有引入 Redis / 分布式锁这类外部依赖；多机部署时需要额外的协调机制 |
-| **无容器化与 CI** | 没有 `Dockerfile` / `docker-compose.yml`，也没有 CI 工作流，测试需要在本地手动执行 `pytest` | 测试本身是完全离线、可重复的（84 项、约 3 秒、不消耗任何 API 额度），补一个 GitHub Actions workflow 即可自动化 |
-| **两处「今天」的基准不统一** | `db.py` 用裸 `datetime.now()`，`tools/search_tools.py` 用配置的 `TIMEZONE`。在 UTC 时区的服务器上会出现日期错位 | 本机与国内部署都在 `Asia/Shanghai`，暂无实际影响；跨时区部署前需要统一到同一个基准 |
+| **无容器化** | 没有 `Dockerfile` / `docker-compose.yml`，部署步骤仍需手工执行 | CI 已经接上（`.github/workflows/ci.yml`），容器化属于部署形态问题，需要时再补 |
+| **无容器化** | 没有 `Dockerfile` / `docker-compose.yml`，部署脚本需要自己写 | 测试与 CI 已具备（见第五节），补容器化属于部署形态问题，与代码正确性无关 |
 | **`SCHEDULE_TIME` 写错会回落到默认值** | `.env` 里填了越界值（例如 `25:00`）时，会打印一行警告并回落到 `08:00`，而不是让启动失败 | 这是刻意的：该解析发生在**模块导入期**，直接抛异常会导致服务完全无法启动，而且报错栈会一路穿过 uvicorn / importlib，最外层信息完全不指向这个配置项。若希望配置错误更强硬地暴露，可改为启动即退出并给出明确退出码 |
 
 > 另有一条非功能性的：**单次生成耗时 1–3 分钟**（一次批量搜索打分 + 若干轮 Agent 决策 + 一次简报生成）。

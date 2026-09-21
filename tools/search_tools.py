@@ -31,10 +31,8 @@ from urllib.parse import urlparse
 import feedparser
 import requests
 
-try:  # Python 3.9+ 标准库；Windows 上依赖 tzdata 提供时区库
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
-    ZoneInfo = None
+from clock import LOCAL_TZ as _LOCAL_TZ
+from clock import local_today
 
 from llm import chat
 
@@ -93,25 +91,10 @@ NEWS_MAX_AGE_DAYS = int(os.getenv("NEWS_MAX_AGE_DAYS", "1"))
 #   true        = 直接丢弃，只保留能确认发布时间的新闻（最严格的"只看今天"）
 NEWS_STRICT_DATE = os.getenv("NEWS_STRICT_DATE", "false").strip().lower() in ("1", "true", "yes")
 
-# 判定"今天"所用的时区。用户看的是北京时间，所以窗口边界也按这个时区算，
-# 否则同一篇 UTC 时间 20:00 的新闻（北京次日 04:00）会被错算成昨天。
-NEWS_TIMEZONE = os.getenv("TIMEZONE", "Asia/Shanghai")
-
+# 时区基准统一由 clock.LOCAL_TZ 提供，本模块不再自己解析 TIMEZONE。
+# 以前这里另存一份 NEWS_TIMEZONE，导致「今天」的判定散成多套基准（详见 clock.py）。
 # Tavily news 主题要求 days 至少为 1
 _TAVILY_MIN_DAYS = 1
-
-
-def _resolve_tz():
-    """解析时区对象，失败时回退到固定 UTC+8，保证功能不中断。"""
-    if ZoneInfo is not None:
-        try:
-            return ZoneInfo(NEWS_TIMEZONE)
-        except Exception:
-            pass
-    return timezone(timedelta(hours=8))
-
-
-_LOCAL_TZ = _resolve_tz()
 
 # 日期解析支持的非标准格式（很多中文源会输出这些）
 _DATE_PATTERNS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%Y%m%d")
@@ -258,10 +241,8 @@ def _is_blocked_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 # 发布时间解析与时窗过滤
 # ---------------------------------------------------------------------------
-
-def local_today() -> date:
-    """当前用户所在时区的「今天」。"""
-    return datetime.now(_LOCAL_TZ).date()
+# 「今天」与目标时区统一由 clock 提供：local_today 直接来自 clock，
+# _LOCAL_TZ 就是 clock.LOCAL_TZ，本模块不再自持一份时区解析。
 
 
 def window_start() -> Optional[date]:

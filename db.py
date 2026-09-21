@@ -17,11 +17,12 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
+
+from clock import DATE_FORMAT, DATETIME_FORMAT, local_now, local_stamp
 
 load_dotenv()
 
@@ -270,24 +271,10 @@ def save_preferences(preferences: Dict[str, Any]) -> str:
     topics = json.dumps(preferences.get("topics", []), ensure_ascii=False)
     keywords = json.dumps(preferences.get("keywords", []), ensure_ascii=False)
 
-    if USE_MYSQL:
-        sql = (
-            "INSERT INTO preferences (id, name, email, topics, keywords, language, max_articles) "
-            "VALUES (1, %s, %s, %s, %s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE name=VALUES(name), email=VALUES(email), "
-            "topics=VALUES(topics), keywords=VALUES(keywords), "
-            "language=VALUES(language), max_articles=VALUES(max_articles)"
-        )
-    else:
-        sql = (
-            "INSERT INTO preferences (id, name, email, topics, keywords, language, max_articles, updated_at) "
-            "VALUES (1, %s, %s, %s, %s, %s, %s, datetime('now','localtime')) "
-            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, email=excluded.email, "
-            "topics=excluded.topics, keywords=excluded.keywords, "
-            "language=excluded.language, max_articles=excluded.max_articles, "
-            "updated_at=datetime('now','localtime')"
-        )
-
+    # updated_at 由应用层按 TIMEZONE 生成后显式写入，不用数据库自己的时间：
+    # SQLite 的 datetime('now','localtime') 和 MySQL 的 ON UPDATE CURRENT_TIMESTAMP
+    # 都跟着数据库服务器时区走，部署到 UTC 主机就会和简报的日期字段差一天。
+    now_text = local_stamp(DATETIME_FORMAT)
     params = (
         preferences.get("name", ""),
         preferences.get("email", ""),
@@ -295,6 +282,23 @@ def save_preferences(preferences: Dict[str, Any]) -> str:
         keywords,
         preferences.get("language", "zh"),
         int(preferences.get("max_articles", 5)),
+        now_text,
+    )
+
+    conflict = (
+        "ON DUPLICATE KEY UPDATE name=VALUES(name), email=VALUES(email), "
+        "topics=VALUES(topics), keywords=VALUES(keywords), "
+        "language=VALUES(language), max_articles=VALUES(max_articles), "
+        "updated_at=VALUES(updated_at)"
+        if USE_MYSQL
+        else "ON CONFLICT(id) DO UPDATE SET name=excluded.name, email=excluded.email, "
+        "topics=excluded.topics, keywords=excluded.keywords, "
+        "language=excluded.language, max_articles=excluded.max_articles, "
+        "updated_at=excluded.updated_at"
+    )
+    sql = (
+        "INSERT INTO preferences (id, name, email, topics, keywords, language, max_articles, updated_at) "
+        "VALUES (1, %s, %s, %s, %s, %s, %s, %s) " + conflict
     )
 
     with get_conn() as conn, get_cursor(conn) as cur:
@@ -335,9 +339,16 @@ def append_to_history(answer: str, auto: bool = False, trace_id: str = "") -> Di
     追加一条历史简报，自动拆分“执行摘要”和“完整 Markdown 正文”。
     手动触发（auto=False）与定时任务（auto=True）共用这一份实现。
     """
+    # 时间字段统一取自 clock.local_now()，与 search_tools 判「今天」用的是同一套基准。
+    # ⚠️ created_at 刻意用 DATETIME_FORMAT（空格分隔）而不是 isoformat()：
+    # digests 是按 created_at 字符串排序的（见 prune_history），isoformat 的 "T"
+    # 字符码大于空格，两种格式混用会让同一天的旧记录排到新记录后面。
+    # 显式写入还有一个好处：不再依赖数据库的 CURRENT_TIMESTAMP 默认值（它跟服务器时区走）。
+    now = local_now()
+    created_at = now.strftime(DATETIME_FORMAT)
     # id 精确到微秒：旧的秒级 id 在同一秒内会冲突，
     # 冲突时 ON DUPLICATE KEY UPDATE 会静默覆盖上一条记录。
-    digest_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    digest_id = now.strftime("%Y%m%d%H%M%S%f")
 
     summary = answer
     content = ""
@@ -348,19 +359,27 @@ def append_to_history(answer: str, auto: bool = False, trace_id: str = "") -> Di
 
     item = {
         "id": digest_id,
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": now.strftime(DATE_FORMAT),
         "summary": summary,
         "content": content,
         "trace_id": trace_id,
         "source": "scheduled" if auto else "manual",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": created_at,
     }
 
     sql = (
-        "INSERT INTO digests (id, digest_date, summary, content, trace_id, source) "
-        "VALUES (%s, %s, %s, %s, %s, %s)"
+        "INSERT INTO digests (id, digest_date, summary, content, trace_id, source, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)"
     )
-    params = (digest_id, item["date"], summary, content, trace_id or None, item["source"])
+    params = (
+        digest_id,
+        item["date"],
+        summary,
+        content,
+        trace_id or None,
+        item["source"],
+        created_at,
+    )
 
     with get_conn() as conn, get_cursor(conn) as cur:
         if not USE_MYSQL:
@@ -421,19 +440,25 @@ def claim_daily_run(name: str, run_date: Optional[str] = None) -> bool:
     APScheduler，同一时刻会有 N 个进程同时触发任务，结果一天发出 N 封邮件。
     这里用数据库主键做原子抢占——只有第一个 INSERT 成功的进程才真正执行。
     """
-    run_date = run_date or datetime.now().strftime("%Y-%m-%d")
+    # run_date 决定「今天是否已经发过」，必须和简报日期同基准：
+    # 否则 UTC 服务器上会出现「北京时间已跨日、抢锁还在用 UTC 日期」，同一天发两封。
+    run_date = run_date or local_stamp(DATE_FORMAT)
+    started_at = local_stamp(DATETIME_FORMAT)
 
     if USE_MYSQL:
-        sql = "INSERT IGNORE INTO job_runs (name, run_date) VALUES (%s, %s)"
+        sql = "INSERT IGNORE INTO job_runs (name, run_date, started_at) VALUES (%s, %s, %s)"
     else:
         sql = (
-            "INSERT INTO job_runs (name, run_date) VALUES (%s, %s) "
+            "INSERT INTO job_runs (name, run_date, started_at) VALUES (%s, %s, %s) "
             "ON CONFLICT(name, run_date) DO NOTHING"
         )
 
     try:
         with get_conn() as conn, get_cursor(conn) as cur:
-            cur.execute(sql if USE_MYSQL else _to_sqlite_sql(sql), (name, run_date))
+            cur.execute(
+                sql if USE_MYSQL else _to_sqlite_sql(sql),
+                (name, run_date, started_at),
+            )
             inserted = cur.rowcount > 0
             if not USE_MYSQL:
                 conn.commit()
@@ -473,6 +498,10 @@ def record_trace(trace_id: str, trace: Iterable[Dict[str, Any]]) -> int:
     记录一次 Agent 运行的完整工具调用轨迹。
     返回写入的条数。
     """
+    # created_at 显式写入，理由同 append_to_history：
+    # 数据库的 CURRENT_TIMESTAMP 默认值跟服务器时区走，换 UTC 主机就对不上简报时间。
+    created_at = local_stamp(DATETIME_FORMAT)
+
     rows = []
     for entry in trace:
         step = entry.get("step", 0)
@@ -483,12 +512,16 @@ def record_trace(trace_id: str, trace: Iterable[Dict[str, Any]]) -> int:
                 tool_result.get("name", "unknown"),
                 json.dumps(tool_result.get("arguments", {}), ensure_ascii=False)[:2000],
                 str(tool_result.get("content", ""))[:2000],
+                created_at,
             ))
 
     if not rows:
         return 0
 
-    sql = "INSERT INTO tool_calls (trace_id, step, tool_name, arguments, result) VALUES (%s, %s, %s, %s, %s)"
+    sql = (
+        "INSERT INTO tool_calls (trace_id, step, tool_name, arguments, result, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s)"
+    )
     with get_conn() as conn, get_cursor(conn) as cur:
         cur.executemany(sql if USE_MYSQL else _to_sqlite_sql(sql), rows)
         if not USE_MYSQL:

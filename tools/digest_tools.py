@@ -3,7 +3,7 @@
 """
 
 import json
-from datetime import datetime
+from clock import local_stamp
 from typing import List, Dict, Any
 
 from llm import chat
@@ -76,7 +76,7 @@ def generate_digest(news: List[Dict[str, Any]], preferences: Dict[str, Any]) -> 
     )
 
     user_prompt = f"""
-今天是：{datetime.now().strftime("%Y-%m-%d")}
+今天是：{local_stamp()}
 用户关注话题：{topics}
 用户关注关键词：{keywords}
 期望语言：{lang_hint}

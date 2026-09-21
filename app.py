@@ -7,7 +7,7 @@ import os
 import secrets
 import uuid
 import threading
-from datetime import datetime
+from clock import local_now
 from typing import Any, Dict, List
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
@@ -170,7 +170,7 @@ def _run_generate_task(task_id: str):
         TASKS[task_id] = {
             "status": "success" if result.get("success") else "failed",
             "result": result,
-            "finished_at": datetime.now().isoformat(),
+            "finished_at": local_now().isoformat(),
         }
 
     # 无论成功失败都要释放单飞锁，否则后续请求会被永久拒绝
@@ -194,7 +194,7 @@ def generate_digest_endpoint(background_tasks: BackgroundTasks, _auth=Depends(re
             detail="已有生成任务正在执行，请等待其完成后再试",
         )
 
-    task_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    task_id = local_now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     with _tasks_lock:
         # 简单清理：任务过多时丢弃最早的已完成记录
@@ -205,7 +205,7 @@ def generate_digest_endpoint(background_tasks: BackgroundTasks, _auth=Depends(re
         TASKS[task_id] = {
             "status": "running",
             "result": None,
-            "created_at": datetime.now().isoformat(),
+            "created_at": local_now().isoformat(),
         }
 
     background_tasks.add_task(_run_generate_task, task_id)
@@ -287,7 +287,7 @@ def preview_digest(req: DigestPreviewRequest, _auth=Depends(require_api_key)):
             "query": query,
             "news": news,
             "digest": digest,
-            "created_at": datetime.now().isoformat(),
+            "created_at": local_now().isoformat(),
         }
     finally:
         # 必须放在 finally：请求中途抛错也要释放，否则预览会被永久锁死

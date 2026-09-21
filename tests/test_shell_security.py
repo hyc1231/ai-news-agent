@@ -10,7 +10,12 @@ import pytest
 
 from tools.file_tools import list_dir, read_file, write_file
 from tools.security import PROJECT_ROOT
-from tools.shell_tools import ALLOWED_COMMANDS, bash
+from tools.shell_tools import (
+    ALLOWED_COMMANDS,
+    _check_safety,
+    _looks_like_path,
+    bash,
+)
 
 
 def _is_rejected(cmd: str) -> bool:
@@ -91,3 +96,64 @@ def test_path_traversal_is_blocked():
 def test_sensitive_file_cannot_be_read_or_written():
     assert "敏感" in read_file(".env")
     assert "敏感" in write_file(".env", "HACKED=1")
+
+
+# --- 路径沙箱 ---------------------------------------------------------------
+#
+# 回归背景：只挡敏感文件名是不够的 —— `cat C:\Windows\win.ini` 能把宿主机上
+# 任意文件读进模型上下文（实测确认过），而新闻正文是**不可信输入**且会进
+# 模型上下文，一段藏在网页里的提示词就足以诱导模型去读它。
+# file_tools 一直有这层边界（走 security.safe_path），shell 侧以前漏了。
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        r"cat C:\Windows\win.ini",  # Windows 绝对路径
+        "cat C:/Windows/win.ini",  # 正斜杠写法
+        r"dir C:\Users",
+        r"dir ..\..\..",  # 逐级上跳
+        r"type ..\..\..\Windows\win.ini",
+        r"cat ..\..\ai-news-agent-BACKUP\x.txt",  # 同级目录：前缀相同但不该放行
+        "cat /etc/passwd",  # Unix 绝对路径
+    ],
+)
+def test_paths_outside_project_are_rejected(cmd):
+    assert "越界" in bash(cmd), f"{cmd} 读到了项目目录之外"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ls",
+        "dir",
+        "dir db",
+        "type README.md",
+        "cat tools/security.py",
+        "type .env.example",
+        "git status",
+        "git log --oneline -3",
+    ],
+)
+def test_paths_inside_project_are_allowed(cmd):
+    """
+    直接问 _check_safety() 拿结论，而不是扫命令输出。
+
+    扫输出会假阳性：README 正文里本身就写着「`.env` 里填了越界值」这类句子，
+    `type README.md` 的输出里就带「越界」二字。
+    """
+    assert _check_safety(cmd) == "", f"{cmd} 是项目内的正常只读操作，被误拦了"
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["-la", "--oneline", "大模型", "README.md", "https://example.com/a", ""],
+)
+def test_plain_arguments_are_not_treated_as_paths(token):
+    """开关与普通关键词不该被当成路径丢进 resolve()。"""
+    assert not _looks_like_path(token)
+
+
+@pytest.mark.parametrize("token", [".", "..", "a/b", r"a\b", r"C:\x", "C:x", "/etc"])
+def test_path_like_arguments_are_detected(token):
+    assert _looks_like_path(token)

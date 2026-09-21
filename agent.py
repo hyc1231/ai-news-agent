@@ -5,7 +5,7 @@ ReAct Agent 核心。
 
 import json
 import traceback
-from datetime import datetime
+from clock import local_stamp
 from typing import Any, Callable, Dict, List
 
 import uuid
@@ -459,7 +459,7 @@ def generate_and_send_digest(trace_id: str = "") -> Dict[str, Any]:
     通过自然语言任务让 Agent 自己决定完整流程（不指定任何步骤）。
     """
     trace_id = trace_id or uuid.uuid4().hex[:12]
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = local_stamp()
 
     # 语言跟随用户偏好：前端「简报语言」选 English 时，提示词与收尾校验都要用英文。
     # 偏好读取失败时回落到中文，不影响主流程。

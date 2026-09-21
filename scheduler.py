@@ -8,7 +8,7 @@ job_runs 表做主键抢占，保证当天只有第一个进程真正执行，�
 
 import os
 import uuid
-from datetime import datetime
+from clock import local_now
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -74,19 +74,19 @@ def run_scheduled_digest(force: bool = False) -> None:
     避免多 worker 部署时同一天重复生成、重复发送。
     """
     if not force and not db.claim_daily_run(DAILY_JOB_NAME):
-        print(f"[{datetime.now().isoformat()}] 今日定时简报任务已由其它进程执行过，本次跳过")
+        print(f"[{local_now().isoformat()}] 今日定时简报任务已由其它进程执行过，本次跳过")
         return
 
-    print(f"[{datetime.now().isoformat()}] 开始执行定时简报任务...")
-    trace_id = f"sched-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    print(f"[{local_now().isoformat()}] 开始执行定时简报任务...")
+    trace_id = f"sched-{local_now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
     result = generate_and_send_digest(trace_id=trace_id)
 
     if result.get("success"):
         # 历史写入逻辑统一由 tools.file_tools 维护
         append_to_history(result.get("answer", ""), auto=True, trace_id=trace_id)
-        print(f"[{datetime.now().isoformat()}] 定时简报任务完成")
+        print(f"[{local_now().isoformat()}] 定时简报任务完成")
     else:
-        print(f"[{datetime.now().isoformat()}] 定时简报任务失败: {result.get('answer')}")
+        print(f"[{local_now().isoformat()}] 定时简报任务失败: {result.get('answer')}")
 
 
 def get_scheduler() -> BackgroundScheduler:

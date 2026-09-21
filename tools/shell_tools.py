@@ -11,9 +11,13 @@ Shell 命令工具。为了安全，只允许执行白名单内的只读/低风�
 4. 命令中不得出现敏感文件（.env / *.key / *.pem 等）——
    否则 cat .env 就能绕过 file_tools 的敏感文件保护，把密钥读进模型上下文。
    敏感文件名单与 file_tools 共用 tools/security.py，避免两处不一致；
-5. 白名单里**不含任何解释器**（python / pip / uvicorn / pytest 等）。
-   这是本模块安全模型的关键一环：只要还能执行任意代码，第 4 条的文件名单
-   就会被绕过——write_file 写一个脚本，再用 bash 运行它即可读到 .env 全文。
+5. 命令里的路径参数必须落在项目目录内，复用同一个 security.safe_path()。
+   这一条是补出来的：只挡敏感文件名并不能阻止 `cat C:\\Windows\\win.ini`
+   把项目外的任意文件读进上下文，而新闻正文是**不可信输入**，
+   一段藏在网页里的提示词就足以诱导模型去读它；
+6. 白名单里**不含任何解释器**（python / pip / uvicorn / pytest 等）。
+   这是本模块安全模型的关键一环：只要还能执行任意代码，第 4、5 条就会被绕过——
+   write_file 写一个脚本，再用 bash 运行它，就能读到 .env 全文或项目外文件。
    因此这里只开放只读的查看类命令，简报流程也不依赖解释器。
 """
 
@@ -23,7 +27,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from tools.security import PROJECT_ROOT, find_sensitive_reference
+from tools.security import PROJECT_ROOT, find_sensitive_reference, safe_path
 
 # 允许执行的命令白名单（第一个 token 必须命中）
 #
@@ -52,6 +56,46 @@ SHELL_BUILTINS = {"dir", "echo", "type", "where", "cls", "cd"}
 WIN_ALIASES = {"ls": "dir", "cat": "type", "pwd": "cd"}
 
 
+def _looks_like_path(token: str) -> bool:
+    """
+    判断一个参数是不是在「指定路径」，而不是开关或普通关键词。
+
+    只看形状、不做业务判断：不先筛一遍的话，`-la`、`--oneline`、`大模型`
+    这类参数都会被当成路径丢进 resolve()。
+    """
+    if not token or token.startswith("-"):
+        return False
+    if token.startswith(("http://", "https://")):
+        return False
+    if len(token) > 1 and token[1] == ":":  # Windows 盘符：C:\... 或 C:foo
+        return True
+    if token in (".", ".."):
+        return True
+    return any(ch in token for ch in ("/", "\\"))
+
+
+def _check_paths(tokens) -> str:
+    """
+    路径沙箱：命令里出现的路径参数必须落在项目目录内。
+
+    为什么必须有这一条：只挡敏感文件名是不够的 —— `cat C:\\Windows\\win.ini`
+    能把宿主机上任意文件读进模型上下文（实测确认过）。而新闻正文是**不可信输入**
+    且会进模型上下文，一段藏在网页里的提示词就足以诱导模型去读它。
+    file_tools 一直有这层边界（走 security.safe_path），shell 侧漏了，现在复用同一份实现。
+    """
+    for token in tokens[1:]:
+        if not _looks_like_path(token):
+            continue
+        try:
+            safe_path(token)
+        except ValueError:
+            return f"命令访问了项目目录之外的路径（路径越界），已被拒绝: {token}"
+        except OSError:
+            # 路径本身非法（含非法字符等）时同样拒绝，这里宁可保守
+            return f"命令包含无法解析的路径，已被拒绝: {token}"
+    return ""
+
+
 def _check_safety(cmd: str) -> str:
     """返回空字符串表示通过检查，否则返回拒绝原因。"""
     try:
@@ -77,6 +121,11 @@ def _check_safety(cmd: str) -> str:
             f"命令引用了敏感文件（含密钥/口令），已被拒绝: {sensitive}。"
             "如需了解配置项，请读取 .env.example 模板文件。"
         )
+
+    # 路径参数必须在项目目录内（cat C:\Windows\win.ini 这类要挡住）
+    path_reason = _check_paths(tokens)
+    if path_reason:
+        return path_reason
 
     # 按单词边界匹配危险 token（形如 rm -rf 的第一个参数）
     for token in tokens[1:]:
