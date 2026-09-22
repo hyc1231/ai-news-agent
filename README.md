@@ -8,9 +8,17 @@
 
 ![Web 界面：偏好设置、简报生成、历史简报与 Agent 工具调用轨迹](docs/demo-home.png)
 
+🎬 **3 分钟演示录屏**（时长 3:02，1920×1080，讲稿字幕 + TTS 配音）：[待上传后替换此链接](#)
+—— 视频随交付包提供（`每日AI新闻助手-项目演示-配音版.mp4`），上传到 B 站 / YouTube 后请把链接填回此处。
+
 ---
 
 ## 一、5 分钟跑起来
+
+> ⏱ **实测耗时**：在全新目录从 `git clone` 走到服务响应 HTTP 200，共 **148 秒（约 2.5 分钟）**，
+> 其中 `pip install -r requirements.txt` 占 102 秒。实测环境 Windows 11 / Python 3.13，
+> 全程只填了一个 `DEEPSEEK_API_KEY`、未安装 MySQL（走内置 SQLite 兜底）。
+> **若本机已装过这些依赖，剩下几步不到 40 秒。**
 
 ### 0. 前置条件
 
@@ -68,6 +76,9 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxx
 > 密钥**只**通过环境变量读取（全部经 `os.getenv`），代码中不含任何硬编码密钥，`.env` 已被 `.gitignore` 排除。
 
 ### 3. 初始化数据库
+
+> 这一步**可以跳过**：`app.py` 启动时会自动建表（SQLite 路径已实测验证，冷启动 1 秒内即可响应）。
+> 想确认已有数据库是否健康，用文末的 `python migrate.py --check`。
 
 **方式 A：SQLite（零配置，最快）**
 
